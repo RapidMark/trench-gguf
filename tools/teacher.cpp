@@ -9,6 +9,12 @@
 //       one bucket for the rest of the vocabulary, the same formula as Abyss's score path), the largest KL of one
 //       position, the 99th percentile, the share of positions with the same top token, and nll.
 //
+//   teacher cmp <model.gguf> <ref.lsm> <seq.ids> [--skip=1] [--per-pos=<file>] [--gpu] [--threads=N]
+//       Compares against a full log-softmax dump of another engine (Abyss's STRATA_GLM_SCORE_DUMP: n_vocab float32
+//       per scored position, the first scored position being --skip, the value of STRATA_GLM_SCORE): exact KL over
+//       the whole vocabulary (the dump as the reference), the share of positions with the same top token, both nlls;
+//       --per-pos writes "position KL same-top" lines.
+//
 //   --gpu: dense tensors on the GPU (-ngl 99), routed experts stay memory-mapped on the host (exps -> CPU buffer) and
 //   llama.cpp copies them to the GPU for each batch (op offload), as llama-imatrix --gpu in tools/imatrix.py does.
 //   Needs a ROCm or CUDA build of llama.cpp; without --gpu a CPU build is enough. A whole file is one batch.
@@ -45,19 +51,24 @@ static std::string stem(const char * path) {
 
 int main(int argc, char ** argv) {
     std::vector<const char *> args;
-    int K = 32, nt = 16;
+    int K = 32, nt = 16, skip = 1;
     bool gpu = false;
+    const char * per_pos = nullptr;
     for (int i = 1; i < argc; ++i) {
         if (!strncmp(argv[i], "--k=", 4)) K = atoi(argv[i] + 4);
         else if (!strncmp(argv[i], "--threads=", 10)) nt = atoi(argv[i] + 10);
         else if (!strcmp(argv[i], "--gpu")) gpu = true;
+        else if (!strncmp(argv[i], "--skip=", 7)) skip = atoi(argv[i] + 7);
+        else if (!strncmp(argv[i], "--per-pos=", 10)) per_pos = argv[i] + 10;
         else args.push_back(argv[i]);
     }
     const bool ref = args.size() >= 4 && !strcmp(args[0], "ref");
     const bool kl = args.size() >= 4 && !strcmp(args[0], "kl");
-    if (!ref && !kl) {
+    const bool cmp = args.size() == 4 && !strcmp(args[0], "cmp");
+    if (!ref && !kl && !cmp) {
         fprintf(stderr, "usage: teacher ref <model.gguf> <out dir> <seq.ids>... [--k=32] [--gpu] [--threads=N]\n"
-                        "       teacher kl  <model.gguf> <ref dir> <seq.ids>... [--gpu] [--threads=N]\n");
+                        "       teacher kl  <model.gguf> <ref dir> <seq.ids>... [--gpu] [--threads=N]\n"
+                        "       teacher cmp <model.gguf> <ref.lsm> <seq.ids> [--skip=1] [--per-pos=<file>] [--gpu] [--threads=N]\n");
         return 2;
     }
     llama_backend_init();
@@ -70,6 +81,54 @@ int main(int argc, char ** argv) {
     if (!model) { fprintf(stderr, "cannot load %s\n", args[1]); return 1; }
     const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model));
     const std::string dir = args[2];
+    if (cmp) {
+        const std::vector<llama_token> ids = read_ids(args[3]);
+        const int n = (int) ids.size();
+        FILE * rf = fopen(args[2], "rb");
+        if (n < skip + 2 || !rf) { fprintf(stderr, "cmp: need %d+ ids and a readable %s\n", skip + 2, args[2]); return 1; }
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx = n + 16; cp.n_batch = n; cp.n_ubatch = n; cp.n_threads = nt; cp.n_threads_batch = nt;
+        llama_context * ctx = llama_init_from_model(model, cp);
+        if (!ctx) { fprintf(stderr, "cannot make a context of %d tokens\n", n); return 1; }
+        llama_batch b = llama_batch_init(n, 0, 1);
+        for (int i = 0; i < n; ++i) { b.token[i] = ids[i]; b.pos[i] = i; b.n_seq_id[i] = 1; b.seq_id[i][0] = 0; b.logits[i] = 1; }
+        b.n_tokens = n;
+        if (llama_decode(ctx, b)) { fprintf(stderr, "decode failed\n"); return 1; }
+        FILE * pf = per_pos ? fopen(per_pos, "w") : nullptr;
+        std::vector<float> rl(nv), ls2(nv);
+        double ks = 0, km = 0, nl = 0, nr = 0;
+        size_t np = 0, sm = 0;
+        std::vector<double> kv;
+        for (int i = skip; i + 1 < n; ++i) {
+            if (fread(rl.data(), sizeof(float), nv, rf) != (size_t) nv) { fprintf(stderr, "cmp: %s ends at position %d\n", args[2], i); return 1; }
+            const float * lg = llama_get_logits_ith(ctx, i);
+            const float mx = *std::max_element(lg, lg + nv);
+            double z = 0;
+            for (int j = 0; j < nv; ++j) z += std::exp((double) lg[j] - mx);
+            const double lse = mx + std::log(z);
+            double k = 0;
+            int am = 0, ar = 0;
+            for (int j = 0; j < nv; ++j) {
+                ls2[j] = (float) (lg[j] - lse);
+                const double p = std::exp((double) rl[j]);
+                if (p > 0) k += p * ((double) rl[j] - (double) ls2[j]);
+                if (lg[j] > lg[am]) am = j;
+                if (rl[j] > rl[ar]) ar = j;
+            }
+            ks += k; km = std::max(km, k); kv.push_back(k); sm += am == ar; ++np;
+            nl -= ls2[ids[i + 1]]; nr -= rl[ids[i + 1]];
+            if (pf) fprintf(pf, "%d %.6f %d\n", i, k, am == ar);
+        }
+        if (pf) fclose(pf);
+        fclose(rf);
+        std::sort(kv.begin(), kv.end());
+        printf("cmp %s: %zu positions | KL %.6f (median %.6f, 99th pct %.4f, max %.4f), same top token %.2f%% | nll %.5f, ref nll %.5f\n",
+               args[3], np, ks / np, kv[kv.size() / 2], kv[(size_t) (0.99 * (kv.size() - 1))], km, 100.0 * sm / np, nl / np, nr / np);
+        llama_batch_free(b);
+        llama_free(ctx);
+        llama_model_free(model);
+        return 0;
+    }
 
     double kl_sum = 0, kl_max = 0, nll_sum = 0;
     size_t npos = 0, same = 0;

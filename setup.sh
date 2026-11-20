@@ -4,8 +4,10 @@
 #   2. its libggml-base.so (the CPU quantizer the GPU output must match; nothing else of llama.cpp is built)
 #   3. the GPU: ROCm (hipcc + rocminfo) or CUDA (nvcc + nvidia-smi), and its architecture
 #   4. gpuq/gpuq_tables.bin + gpuq/libgpuq.so (ROCm) or gpuq/libgpuq_cuda.so (CUDA)   (build.sh)
-#   5. llama.cpp on the GPU (third_party/llama.cpp-gpu, the same commit + patches/llama-expert-upload.diff: libllama +
-#      llama-imatrix) and tools/teacher (quality check) and tools/hessian_dump (LDLQ's Hessian material) built on it
+#      (+ patches/llama-hy4.diff on the cloned copy: Hy4-flash / hy_v4_flash support, see recipes/hy4)
+#   5. llama.cpp on the GPU (third_party/llama.cpp-gpu, the same commit + patches/llama-hy4.diff +
+#      patches/llama-expert-upload.diff: libllama, llama-imatrix, llama-quantize, llama-perplexity) and tools/teacher
+#      (quality check) and tools/hessian_dump (LDLQ's Hessian material) built on it
 #   6. a Python venv (.venv) with numpy, pyarrow (tools/imatrix.py), huggingface_hub (the hf command), llama.cpp's gguf-py
 #      and its converter's packages (torch for the CPU, transformers, sentencepiece: tools/convert_hf.py);
 #      --torch-gpu: the same torch version built for your GPU instead (LDLQ's error-feedback loop on the GPU)
@@ -38,6 +40,17 @@ done
 step() { printf '\n\033[1m[%s] %s\033[0m\n' "$1" "$2"; }
 ok() { printf '  \033[32mok\033[0m %s\n' "$*"; }
 fail() { printf '  \033[31mfailed:\033[0m %s\n' "$1"; [ -n "${2:-}" ] && printf '  -> %s\n' "$2"; exit 1; }
+# apply_patch <tree> <patch>: apply once (skipped when it is already in), warn when it does not fit this llama.cpp
+apply_patch() {
+  if (cd "$1" && git apply --check "$ROOT/patches/$2" 2>/dev/null); then
+    (cd "$1" && git apply "$ROOT/patches/$2") && echo "  patched: patches/$2"
+  elif (cd "$1" && git apply --check --reverse "$ROOT/patches/$2" 2>/dev/null); then
+    echo "  already patched: patches/$2"
+  else
+    echo "  warning: patches/$2 does not apply to this llama.cpp ($1)"
+    return 1
+  fi
+}
 
 step 1/8 "llama.cpp"
 if [ -z "$LLAMA" ]; then
@@ -47,6 +60,9 @@ if [ -z "$LLAMA" ]; then
     git clone --quiet https://github.com/ggml-org/llama.cpp "$LLAMA"
   fi
   [ -n "$REF" ] && git -C "$LLAMA" checkout --quiet "$REF"
+  # the cloned copy only (a --llama checkout of yours is not touched): Hy4-flash support for the converter, gguf-py
+  # (the F8_E4M3 type of the Engram tables) and libggml-base
+  apply_patch "$LLAMA" llama-hy4.diff || echo "  -> Hy4-flash (hy_v4_flash) GGUFs will not convert or load"
 fi
 [ -f "$LLAMA/ggml/src/ggml-quants.c" ] || fail "$LLAMA has no ggml/src/ggml-quants.c" "pass --llama <a llama.cpp checkout>"
 ok "$LLAMA ($(git -C "$LLAMA" log -1 --format='%h %cd' --date=short 2>/dev/null || echo 'not a git checkout'))"
@@ -98,7 +114,7 @@ ok "gpuq/gpuq_tables.bin, gpuq/$LIB"
 
 step 5/8 "llama.cpp on the GPU (llama-imatrix, tools/teacher)"
 if [ -z "$GBUILD" ]; then
-  # a copy of the same llama.cpp commit with patches/llama-expert-upload.diff (experts reach the GPU through pinned
+  # a copy of the same llama.cpp commit with patches/llama-hy4.diff and patches/llama-expert-upload.diff (experts reach the GPU through pinned
   # memory: without it a model bigger than RAM stalls on the GPU); your checkout is not touched
   GSRC=$ROOT/third_party/llama.cpp-gpu
   if [ ! -d "$GSRC" ]; then
@@ -107,14 +123,13 @@ if [ -z "$GBUILD" ]; then
     else
       cp -a "$LLAMA" "$GSRC"
     fi
-    if (cd "$GSRC" && git apply --check "$ROOT/patches/llama-expert-upload.diff" 2>/dev/null); then
-      (cd "$GSRC" && git apply "$ROOT/patches/llama-expert-upload.diff") && echo "  patched: patches/llama-expert-upload.diff"
-    else
-      echo "  warning: patches/llama-expert-upload.diff does not apply to this llama.cpp - the GPU imatrix may stall"
-    fi
   fi
+  # also run on an existing copy: a newer trench-gguf may bring a patch the copy does not have yet
+  apply_patch "$GSRC" llama-hy4.diff || echo "  -> Hy4-flash (hy_v4_flash) will not load on the GPU build"
+  apply_patch "$GSRC" llama-expert-upload.diff || echo "  -> the GPU imatrix may stall on models bigger than RAM"
   GBUILD=$GSRC/build-gpu
-  if [ ! -x "$GBUILD/bin/llama-imatrix" ]; then
+  if [ ! -x "$GBUILD/bin/llama-imatrix" ] || [ ! -x "$GBUILD/bin/llama-quantize" ] || \
+     [ -n "$(find "$GSRC/src" "$GSRC/ggml/src" -newer "$GBUILD/bin/llama-imatrix" -name '*.c*' -print -quit 2>/dev/null)" ]; then
     echo "  building (10-30 minutes the first time; log: setup-cmake-gpu.log)"
     if [ "$BACKEND" = hip ]; then
       GPU_FLAGS=(-DGGML_HIP=ON -DGPU_TARGETS="${ARCH//,/;}" -DCMAKE_HIP_COMPILER="$(hipconfig -l 2>/dev/null)/clang")
@@ -124,8 +139,8 @@ if [ -z "$GBUILD" ]; then
     cmake -S "$GSRC" -B "$GBUILD" -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_NATIVE=ON "${GPU_FLAGS[@]}" \
           -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF \
           > "$ROOT/setup-cmake-gpu.log" 2>&1 || fail "cmake configure (GPU)" "see setup-cmake-gpu.log"
-    cmake --build "$GBUILD" --target llama-imatrix -j"$(nproc)" >> "$ROOT/setup-cmake-gpu.log" 2>&1 \
-      || fail "building llama-imatrix" "see setup-cmake-gpu.log"
+    cmake --build "$GBUILD" --target llama-imatrix llama-quantize llama-perplexity -j"$(nproc)" >> "$ROOT/setup-cmake-gpu.log" 2>&1 \
+      || fail "building llama-imatrix / llama-quantize / llama-perplexity" "see setup-cmake-gpu.log"
   fi
 fi
 [ -x "$GBUILD/bin/llama-imatrix" ] || fail "$GBUILD/bin/llama-imatrix not found" "pass --llama-gpu-build <a ROCm/CUDA build folder>"

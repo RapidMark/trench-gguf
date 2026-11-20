@@ -353,6 +353,7 @@ trench-gguf が量子化し直すのは、**MoE モデルのエキスパート**
 | 35B-A3B 系（`qwen35moe`：Ornith-1.0/1.5-35B、Qwen-AgentWorld、Holo4、Tiel-Coder など）、Laguna-S-2.1 | すべて 256 の倍数 | — | 見出し | ○ |
 | Qwen3 MoE（`qwen3moe`：llm-jp-4.1-32b-a3b など） | gate/up 2048、**down 768 / 960** | — | 見出し | △（down は IQ4_NL） |
 | Gemma 4 26B-A4B（`gemma4`） | まとまった gate_up 2816、**down 704** | — | 見出し | △（down は IQ4_NL。`ffn_gate_up_exps` の規則を書く） |
+| Hy4-flash（`hy_v4_flash`、`patches/llama-hy4.diff` が必要） | gate/up/down 1536（latent）、512 個 | — | 読み込み、imatrix、量子化、Abyss との KL（[recipes/hy4](recipes/hy4/README.ja.md)） | ○（変換スクリプトは合成データでのみ確認） |
 
 ◎ 通しで実行済み、○ 形が合う（表にあるものは `--check` と GPU の一致も確認）、△ 一部のテンソルは代わりの型になる。
 

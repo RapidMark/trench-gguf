@@ -321,6 +321,7 @@ plus the runs below):
 | 35B-A3B family (`qwen35moe`: Ornith-1.0/1.5-35B, Qwen-AgentWorld, Holo4, Tiel-Coder, ...), Laguna-S-2.1 | all multiples of 256 | — | headers | ○ |
 | Qwen3 MoE (`qwen3moe`: llm-jp-4.1-32b-a3b, ...) | gate/up 2048, **down 768 / 960** | — | headers | △ (down → IQ4_NL) |
 | Gemma 4 26B-A4B (`gemma4`) | fused gate_up 2816, **down 704** | — | headers | △ (down → IQ4_NL; write a rule for `ffn_gate_up_exps`) |
+| Hy4-flash (`hy_v4_flash`, needs `patches/llama-hy4.diff`) | gate/up/down 1536 (latent), 512 experts | — | loads, imatrix, quantize; KL against Abyss ([recipes/hy4](recipes/hy4/README.md)) | ○ (converter: synthetic test only) |
 
 ◎ run end to end, ○ shapes fit (and `--check` / the GPU match where listed), △ partly: some tensors fall back.
 
