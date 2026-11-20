@@ -3,7 +3,7 @@
 Every release is on GitHub (Releases) with these notes. Update: `git pull`, then `./setup.sh` (it rebuilds only what
 changed).
 
-## Unreleased
+## v0.4.0 - 2026-11-20
 
 **Hy4-flash (`hy_v4_flash`) in trench-gguf's llama.cpp copy**: convert, imatrix, quantize and check Tencent's
 Hy4-flash with the usual steps ([recipes/hy4](recipes/hy4/README.md)).
@@ -20,9 +20,10 @@ Hy4-flash with the usual steps ([recipes/hy4](recipes/hy4/README.md)).
   tensors (41 MoE layers x gate / up / down) included; 23.4 s per pass of 2,048 tokens, peak RSS 47.9 GB.
 - `llama-quantize` on Maya-XS (experts copied, Engram table FP8 -> IQ4_NL, dense Q6_K -> Q8_0): 100.7 -> 75.9 GiB in
   22 min on 16 CPU threads; the result loads and runs (mix459 KL 0.175 against Abyss on the original, rounding an
-  already-FP8 table twice).
+  already-FP8 table twice, and `output` fell to Q5_K; `output` now follows the Q8_0 floor too, checked with
+  `--dry-run`).
 - `tools/teacher cmp`: KL against another engine's full log-softmax dump (Abyss's `STRATA_GLM_SCORE_DUMP`).
-- Not run yet: the converter on the full 440 GB checkpoint (tested on a synthetic checkpoint with the real layout and
+- Not run yet (beta): the converter on the full 440 GB checkpoint (tested on a synthetic checkpoint with the real layout and
   by range reads of real tensors against nace's GGUF).
 
 ## v0.3.1 - 2026-11-04
