@@ -40,7 +40,9 @@ See the worklog numbers in the [CHANGELOG](../../CHANGELOG.md) entry; in short:
 
   Not zero: the two engines do the same math in different orders and precisions (Abyss token by token with its own
   kernels, llama.cpp in 512-token batches with F16 KV), and at 2 bits the router flips experts on near ties. Neither
-  side's nll is consistently lower. Positions 0-136 (the Japanese part of mix459) agree closer (mean KL 0.011 / 0.008)
+  side's nll is consistently lower. On the first 192 tokens of mix459 with Maya-XS, both engines against the numpy
+  reference (`ref/hy4.py`, float64, the same file): llama.cpp KL 0.021 / 98.4% same top, Abyss 0.017 / 97.4%,
+  llama.cpp against Abyss 0.029: each engine is as close to the reference as to the other. Positions 0-136 (the Japanese part of mix459) agree closer (mean KL 0.011 / 0.008)
   than the English and code after it (0.16 / 0.11).
 - **Against a numpy reference** (Abyss's `ref/hy4.py`) on a tiny random model with the checkpoint's layout (33
   layers, 4 Engram layers, the indexer selecting from 16 keys): KL 0.000002 at 16 tokens; at 60 tokens median

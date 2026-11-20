@@ -14,7 +14,8 @@ Hy4-flash with the usual steps ([recipes/hy4](recipes/hy4/README.md)).
   `HYV4FlashForCausalLM` converter. Names and keys match the published GGUFs; Maya-XS and nace Q3_K_M load as they are.
 - Checked against Abyss on the same ids (KL over the whole vocabulary): Maya-XS mix459 0.118 / 93.4% same top token,
   ja2k (2,046 positions) 0.106 / 88.4%; nace Q3_K_M mix459 0.083 / 93.7%, ja2k 0.062 / 91.8%. Against the numpy
-  reference on a tiny random model with the real layout: KL 0.000002 (16 tokens).
+  reference on a tiny random model with the real layout: KL 0.000002 (16 tokens); on Maya-XS's first 192 mix459
+  tokens against that reference: llama.cpp 0.021, Abyss 0.017 (llama.cpp against Abyss 0.029).
 - `llama-imatrix` on Maya-XS (4 chunks of 512, experts from the host, 5090): 814 entries, every one of the 123 expert
   tensors (41 MoE layers x gate / up / down) included; 23.4 s per pass of 2,048 tokens, peak RSS 47.9 GB.
 - `llama-quantize` on Maya-XS (experts copied, Engram table FP8 -> IQ4_NL, dense Q6_K -> Q8_0): 100.7 -> 75.9 GiB in
