@@ -3,7 +3,7 @@
 Every release is on GitHub (Releases) with these notes. Update: `git pull`, then `./setup.sh` (it rebuilds only what
 changed).
 
-## Unreleased
+## v0.5.0 - 2026-11-21
 
 **The k-quants and Q8_0 on the GPU, and the GPU by default.**
 
