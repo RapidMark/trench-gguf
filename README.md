@@ -2,7 +2,7 @@
 
 # trench-gguf
 
-**Quantize GGUF i-quants (IQ1_S, IQ1_M, IQ2_XXS, IQ2_S) on the GPU — byte-identical to llama-quantize.**
+**Quantize GGUF on the GPU — the i-quants, the k-quants and Q8_0 — byte-identical to llama-quantize.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
@@ -37,8 +37,11 @@ the search, no change in quality. A whole DeepSeek V4.1 expert set took 15.5 min
 ## ✨ Highlights
 
 - **Byte-identical to llama.cpp** — every block of IQ1_S / IQ1_M / IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S /
-  IQ4_XS / IQ4_NL matches `ggml_quantize_chunk` (checked on DeepSeek V4.1 experts and on random weights; a
-  re-quantized GGUF layer is `cmp`-identical).
+  IQ4_XS / IQ4_NL, of Q2_K / Q3_K / Q4_K / Q5_K / Q6_K (with and without an imatrix) and of Q8_0 matches
+  `ggml_quantize_chunk` (checked on DeepSeek V4.1 and Hy4-flash weights and on random weights; a whole re-quantized
+  Hy4-flash GGUF has every tensor identical to llama-quantize's).
+- **The GPU by default** — `requant_experts.py` and `convert_hf.py` find the GPU library themselves; `--cpu` forces
+  the CPU, and without a built library or a GPU they say so and use the CPU.
 - **The source is read on the GPU too** — MXFP4 / Q8_0 / F16 / BF16 / F32 experts go to the GPU as they are stored
   (1/8 to 1/2 of the bytes of floats) and are dequantized there, bit for bit as ggml does.
 - **5x a 32-thread CPU, 50-100x one thread** — one 384-expert tensor in about 5 s instead of 27 s.
@@ -203,7 +206,7 @@ Only shard 2 (layers 0-3) is written again (about 49 GB); the other shards are h
 | `No space left on device` | free space or move the work folder to a bigger disk (Step 1) |
 | `hf: command not found` / `python: ... numpy` | run `source ~/trench-gguf/trench.env` in this terminal |
 | `gpuq_init failed` | the GPU is not visible: `rocminfo` or `nvidia-smi` should list it; run `./setup.sh` again |
-| `MISMATCH` in `setup.sh`'s self-test | do not use `--gpu`; open an issue with `setup-test.log` |
+| `MISMATCH` in `setup.sh`'s self-test | pass `--cpu` to the tools; open an issue with `setup-test.log` |
 
 ## 🎯 LDLQ walkthrough: the published DeepSeek V4.1 LDLQ 132G / 139G
 
@@ -348,7 +351,7 @@ plus the runs below):
 The general form (the [walkthrough](#-walkthrough-deepseek-v41-flash-step-by-step) fills it in):
 
 ```bash
-python tools/requant_experts.py <source shard 1> <out folder> <rules file> --imatrix=<imatrix.gguf> --gpu
+python tools/requant_experts.py <source shard 1> <out folder> <rules file> --imatrix=<imatrix.gguf>
 ```
 
 The rules file has one tensor-name regex and one type per line; the first match wins:
@@ -363,9 +366,12 @@ blk\.\d+\.ffn_down_exps\.weight                     iq2_s
   of DeepSeek V4.1 keeps the experts as the released MXFP4, so nothing is lost before the re-quantization.
 - An NVFP4 source (e.g. magnitudedev's Qwen3.8-Flash-Next NVFP4 GGUF) works too: its per-expert `.scale` is folded
   into the weights, and the `.scale` / `.input_scale` tensors of re-made experts are left out of the output.
-- `--gpu` runs IQ1_S / IQ1_M / IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / IQ4_NL on the GPU (`--gpu=1`
-  for GPU 1); other types (k-quants) stay on the CPU. Lines ending in `(gpu)` ran entirely on the GPU; `(gpu quant,
-  cpu dequant)` means the source type (a k-quant or an i-quant) was dequantized on the CPU first.
+- The GPU quantizes by default: the i-quants, Q2_K ... Q6_K and Q8_0, the 2-D tensors the rules name too (a big one
+  in row batches). `--gpu=1` picks GPU 1, `--cpu` uses the CPU threads (ggml) instead. Without imatrix data for a
+  tensor, the k-quants, Q8_0, IQ4_NL and IQ4_XS take ggml's no-imatrix path on the GPU; IQ3_XXS / IQ3_S without one
+  run on the CPU. Lines ending in `(gpu)` ran entirely on the GPU; `(gpu quant, cpu dequant)` means the source type
+  (a k-quant or an i-quant) was dequantized on the CPU first. `GPUQ_BATCH_MB` (default 2048) is how many MB of
+  floats go to the GPU a call.
 - `--check` prints the plan and the sizes without writing.
 
 ### Convert a Hugging Face model (no GGUF published yet)
@@ -375,7 +381,7 @@ python tools/convert_hf.py ~/models/NewModel ~/gguf/NewModel-Q8_0.gguf --outtype
 python tools/imatrix.py calib calib.txt
 python tools/imatrix.py run ~/gguf/NewModel-Q8_0-00001-of-00004.gguf calib.txt ~/gguf/NewModel.imatrix.gguf
 python tools/convert_hf.py ~/models/NewModel ~/gguf/NewModel-IQ2.gguf --rules=newmodel.rules \
-       --imatrix=~/gguf/NewModel.imatrix.gguf --gpu --split-max-size=50G
+       --imatrix=~/gguf/NewModel.imatrix.gguf --split-max-size=50G
 ```
 
 1. A first GGUF to make the imatrix from (Q8_0 is about half the size of BF16; when even that does not fit, give the
@@ -396,8 +402,8 @@ python tools/imatrix.py stats ~/gguf/NewModel.imatrix.gguf
 imatrix-v4-0731.gguf: 129 expert tensors, 33024 experts; tokens per expert min 16, 1st pct 297, median 2692; under 1,000: 3114 (9.4%)
 ```
 
-Tensors no rule names get `--outtype` (llama.cpp's converter keeps norms, routers and the like in F32). The i-quants
-are quantized on the GPU with `--gpu`, the rest through ggml; the result is byte-identical to converting to BF16 and
+Tensors no rule names get `--outtype` (llama.cpp's converter keeps norms, routers and the like in F32). The rules'
+types are quantized on the GPU (`--cpu`: through ggml on the CPU); the result is byte-identical to converting to BF16 and
 running `requant_experts.py` (checked on a small Qwen3-MoE model). It needs torch, transformers and sentencepiece,
 which `./setup.sh` installs.
 
@@ -491,10 +497,24 @@ AI PRO R9700 (OCuLink Gen4 x4), 16-core Ryzen (32 threads), DeepSeek V4.1 Flash 
 
 About half of the GPU's time is the float weights crossing PCIe.
 
+RTX 5090 (OCuLink Gen4 x4), the same CPU, Hy4-flash from its BF16 GGUF (438 GB, on a second NVMe), 2026-11-21. The
+CPU is `requant_experts.py --cpu --threads=32` and llama-quantize with 32 threads; GNU time wall clock, the source
+partly in the page cache for the one-tensor / one-layer rows.
+
+| | CPU (ggml) | GPU (trench-gguf) |
+| --- | --- | --- |
+| one expert, 1536 x 1536 (one thread vs one call) | Q3_K 0.059 s, IQ3_XXS 0.70 s, Q8_0 0.005 s | 0.002 s, 0.005 s, 0.002 s |
+| one tensor, 512 experts -> IQ3_XXS | 20 s (32 s with start-up) | 2 s (14 s with start-up) |
+| one layer (3 expert tensors IQ3_XXS + 13 matrices Q8_0) | 60 s (72 s with start-up) | 3 s (15 s with start-up), `cmp`-identical |
+| the whole model, A's layout (IQ2_XXS / IQ3_XXS experts, Q8_0 rest, 118 GiB per-layer embedding IQ4_NL) | 51 min 33 s (llama-quantize) | 5 min 22 s, all 1,380 tensors identical |
+
+The start-up is reading the 0.8 GB imatrix and opening the source.
+
 ## 🧠 How it works
 
-- **The same code**: each GPU thread quantizes one 256-weight super-block with ggml's `quantize_row_*_impl`, ported
-  line for line.
+- **The same code**: each GPU thread quantizes one 256-weight super-block (Q8_0 / IQ4_NL: one 32-weight block) with
+  ggml's `quantize_row_*_impl` (the i-quants, ported line for line; the k-quants, written from ggml's semantics with
+  its operand and summation order, and its `*_ref` search when there is no imatrix).
 - **The same tables**: `gpuq/gpuq_tables.c` includes `ggml-quants.c` itself and writes the grid, map and neighbour
   lists that `iq2xs_init_impl` builds.
 - **The same arithmetic**: llama.cpp's `libggml-base` is built without FMA, so the GPU build turns FMA contraction off
@@ -505,11 +525,12 @@ About half of the GPU's time is the float weights crossing PCIe.
 
 ## ⚠️ Limits
 
-- **Types**: IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL on the GPU; the k-quants (Q2_K ...
-  Q6_K) run on the CPU through ggml. Sources dequantized on the GPU: F32, F16, BF16, Q8_0, MXFP4.
+- **Types**: IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K and
+  Q8_0 on the GPU; other target types (Q4_0, Q5_0, Q5_1 ... the fallbacks for rows a type cannot hold) run on the CPU
+  through ggml. Sources dequantized on the GPU: F32, F16, BF16, Q8_0, MXFP4.
 - **Models**: MoE experts only; see [Supported models](#-supported-models) for rows that fall back and why.
-- **CUDA**: checked on an RTX 5090 (sm_120, CUDA 13): all 9 types and the GPU-read sources byte-identical, the LDLQ
-  loop's test passes.
+- **CUDA**: checked on an RTX 5090 (sm_120, CUDA 13): all 15 types and the GPU-read sources byte-identical, the LDLQ
+  loop's test passes. The k-quants and Q8_0 are not checked on ROCm yet (the self-test of `./setup.sh` tells).
 - **LDLQ**: the GPU loop needs torch for your GPU (`./setup.sh --torch-gpu`); without it, `--dump-device=cpu` runs
   the same loop on the CPU, much slower. Experts with fewer than 64 calibration rows fall back to plain rounding.
 - **Platforms**: checked on x86-64 Linux only. On ARM, gcc fuses FMA by default, so ggml's own CPU output changes;

@@ -3,6 +3,27 @@
 Every release is on GitHub (Releases) with these notes. Update: `git pull`, then `./setup.sh` (it rebuilds only what
 changed).
 
+## Unreleased
+
+**The k-quants and Q8_0 on the GPU, and the GPU by default.**
+
+- `gpuq`: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K (with an imatrix: ggml's `quantize_row_*_impl` search; without one: the
+  `*_ref` search, as `ggml_quantize_chunk` picks) and Q8_0, byte-identical to ggml. IQ4_NL / IQ4_XS without an
+  imatrix too. `gpuq_quantize_batch` / `gpuq_requantize_batch` quantize many matrices a launch (each its own imatrix
+  row); `gpuq_can_quantize(type, with_imatrix)` says what the library takes. Rebuild with `./build.sh` (or
+  `./setup.sh`).
+- `requant_experts.py` and `convert_hf.py` quantize on the GPU by default: they find `libgpuq_cuda.so` or `libgpuq.so`,
+  and without one (or without a GPU) print why and use the CPU. `--cpu` forces the CPU, `--gpu=N` picks the device.
+  Experts go to the GPU in batches (`GPUQ_BATCH_MB`, default 2048) with the next batch read while the GPU works; big
+  2-D tensors in row batches (Hy4-flash's 118 GiB per-layer embedding). With `--dump-device=cuda` the LDLQ loop now
+  runs on the GPU without `--gpu` (`--ldlq-cpu` keeps the CPU loop).
+- Checked on an RTX 5090: `test_gpuq.py` all 15 types identical on random weights (with zero, constant, one-signed and
+  tiny blocks) and on Hy4-flash BF16 experts; Hy4-flash re-made from its BF16 GGUF in A's layout (IQ2_XXS / IQ3_XXS
+  experts, Q8_0 elsewhere, IQ4_NL embedding table) in 5 min 22 s against 51 min 33 s for llama-quantize on 32
+  threads, every one of the 1,380 tensors identical to llama-quantize's file.
+- Not checked yet: the k-quants and Q8_0 on ROCm (the self-test of `./setup.sh` tells); `convert_hf.py` end to end
+  with the new defaults.
+
 ## v0.4.0 - 2026-11-20
 
 **Hy4-flash (`hy_v4_flash`) in trench-gguf's llama.cpp copy**: convert, imatrix, quantize and check Tencent's

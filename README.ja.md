@@ -2,7 +2,7 @@
 
 # trench-gguf
 
-**GGUF の i-quant（IQ1_S、IQ1_M、IQ2_XXS、IQ2_S）を GPU で量子化する。結果は llama-quantize とバイト単位で同じ。**
+**GGUF を GPU で量子化する（i-quant、k-quant、Q8_0）。結果は llama-quantize とバイト単位で同じ。**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
@@ -40,9 +40,12 @@ DeepSeek V4.1 のエキスパート全部を、AI PRO R9700 で 15 分半で量�
 ## ✨ 特長
 
 - **llama.cpp とバイト単位で同じ**
-  - IQ1_S / IQ1_M / IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / IQ4_NL のすべてのブロックが、`ggml_quantize_chunk` の出力と一致します。
-  - DeepSeek V4.1 のエキスパートと、乱数の重みで確かめました。
-  - 1 層を量子化し直した GGUF も、`cmp` でまったく同じでした。
+  - IQ1_S / IQ1_M / IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / IQ4_NL、Q2_K / Q3_K / Q4_K / Q5_K / Q6_K（imatrix あり・なしの両方）、Q8_0 のすべてのブロックが、`ggml_quantize_chunk` の出力と一致します。
+  - DeepSeek V4.1 と Hy4-flash の重み、乱数の重みで確かめました。
+  - Hy4-flash を丸ごと量子化し直した GGUF も、すべてのテンソルが llama-quantize の出力と同じでした。
+- **GPU が標準**
+  - `requant_experts.py` と `convert_hf.py` は、GPU 用ライブラリを自分で探して GPU で量子化します。
+  - `--cpu` で CPU に切り替えます。ライブラリが無い、GPU が無いときは、そう表示して CPU で計算します。
 - **CPU 32 スレッドの 5 倍、1 スレッドの 50〜100 倍**
   - エキスパート 384 個のテンソル 1 本が、27 秒から約 5 秒になりました。
 - **LDLQ：形式はそのまま、丸め方だけ良くする**
@@ -220,7 +223,7 @@ ls -lh mix
 | `No space left on device` | 空きを作るか、作業フォルダを大きいディスクに移す（手順 1） |
 | `hf: command not found`、`python: ... numpy` | そのターミナルで `source ~/trench-gguf/trench.env` を流す |
 | `gpuq_init failed` | GPU が見えていない。`rocminfo` か `nvidia-smi` に GPU が出るか確かめ、`./setup.sh` をもう一度流す |
-| `setup.sh` の自己テストで `MISMATCH` | `--gpu` を使わない。`setup-test.log` を付けて issue を立てる |
+| `setup.sh` の自己テストで `MISMATCH` | ツールに `--cpu` を付ける。`setup-test.log` を付けて issue を立てる |
 
 ## 🎯 LDLQ の実例：公開している DeepSeek V4.1 LDLQ 132G / 139G を作る
 
@@ -380,7 +383,7 @@ trench-gguf が量子化し直すのは、**MoE モデルのエキスパート**
 一般的な書き方です（具体的な値を入れたものは[実例](#-実例-deepseek-v41-flash-を一から作る)にあります）。
 
 ```bash
-python tools/requant_experts.py <元のシャード 1> <出力フォルダ> <規則ファイル> --imatrix=<imatrix.gguf> --gpu
+python tools/requant_experts.py <元のシャード 1> <出力フォルダ> <規則ファイル> --imatrix=<imatrix.gguf>
 ```
 
 規則ファイルは、1 行に「テンソル名の正規表現」と「型」を書きます。上から見て、最初に当てはまった行が使われます。
@@ -395,9 +398,10 @@ blk\.\d+\.ffn_down_exps\.weight                     iq2_s
   - 元のファイルの丸め誤差に、新しい量子化の誤差が重なります。
   - たとえば DeepSeek V4.1 なら、unsloth の UD-Q4_K_XL のエキスパートは配布元の MXFP4 そのままです。量子化し直す前に失われるものがありません。
   - NVFP4 の GGUF（たとえば magnitudedev の Qwen3.8-Flash-Next NVFP4）も元にできます。エキスパートごとの `.scale` を重みに掛けて読み、量子化し直したエキスパートの `.scale` / `.input_scale` は出力に入れません。
-- **`--gpu`**
-  - IQ1_S / IQ1_M / IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / IQ4_NL を GPU で計算します。2 枚目の GPU を使うときは `--gpu=1` です。
-  - それ以外の型（k-quant）は CPU で計算します。
+- **GPU（標準）と `--cpu`**
+  - i-quant、Q2_K〜Q6_K、Q8_0 を GPU で計算します。規則で指定した 2 次元のテンソルも GPU です（大きいものは行に分けて送ります）。2 枚目の GPU を使うときは `--gpu=1`、CPU（ggml）で計算するときは `--cpu` です。
+  - imatrix にデータの無いテンソルは、k-quant、Q8_0、IQ4_NL、IQ4_XS なら ggml の imatrix なしの計算を GPU で行います。IQ3_XXS / IQ3_S は CPU で計算します。
+  - 1 回に GPU へ送る float の量は `GPUQ_BATCH_MB`（標準 2048 MB）で変えられます。
   - ログの行末に `(gpu)` と付いたものは、元の重みを読むところから全部 GPU で計算したテンソルです。
   - `(gpu quant, cpu dequant)` は、元の型（k-quant や i-quant）を CPU で float に戻してから、GPU で量子化したものです。
 - **`--check`**：書き出さずに、計画と大きさだけを表示します。
@@ -409,7 +413,7 @@ python tools/convert_hf.py ~/models/NewModel ~/gguf/NewModel-Q8_0.gguf --outtype
 python tools/imatrix.py calib calib.txt
 python tools/imatrix.py run ~/gguf/NewModel-Q8_0-00001-of-00004.gguf calib.txt ~/gguf/NewModel.imatrix.gguf
 python tools/convert_hf.py ~/models/NewModel ~/gguf/NewModel-IQ2.gguf --rules=newmodel.rules \
-       --imatrix=~/gguf/NewModel.imatrix.gguf --gpu --split-max-size=50G
+       --imatrix=~/gguf/NewModel.imatrix.gguf --split-max-size=50G
 ```
 
 1. imatrix を作るための 1 つ目の GGUF を作ります。Q8_0 なら BF16 の約半分です。それでも SSD に入らないときは、規則ファイルでエキスパートを `iq4_xs` にします（imatrix が要りません）。
@@ -430,7 +434,7 @@ imatrix-v4-0731.gguf: 129 expert tensors, 33024 experts; tokens per expert min 1
 ```
 
 - 規則に書いていないテンソルは `--outtype` の型になります（ノルムやルーターなどは、llama.cpp の変換スクリプトが F32 のまま残します）。
-- `--gpu` を付けると i-quant は GPU で、それ以外は ggml で量子化します。
+- 規則で指定した型は GPU で量子化します（`--cpu` なら ggml で CPU）。
 - 結果は、いったん BF16 の GGUF にしてから `requant_experts.py` で量子化したものと、バイト単位で同じです（小さな Qwen3-MoE のモデルで確かめました）。
 - torch、transformers、sentencepiece が要ります。`./setup.sh` が入れます。
 
@@ -522,9 +526,20 @@ AI PRO R9700（OCuLink Gen4 x4）、16 コアの Ryzen（32 スレッド）、De
 
 GPU の時間の約半分は、float の重みを PCIe で送る時間です。
 
+RTX 5090（OCuLink Gen4 x4）、同じ CPU、Hy4-flash の BF16 GGUF（438 GB、2 台目の NVMe）から作りました（2026-11-21）。CPU は `requant_experts.py --cpu --threads=32` と 32 スレッドの llama-quantize です。時間は GNU time の経過時間で、テンソル 1 本と 1 層の行は、元のファイルが一部ページキャッシュに載った状態です。
+
+| | CPU（ggml） | GPU（trench-gguf） |
+| --- | --- | --- |
+| エキスパート 1 個、1536 x 1536（1 スレッドと 1 回の呼び出し） | Q3_K 0.059 秒、IQ3_XXS 0.70 秒、Q8_0 0.005 秒 | 0.002 秒、0.005 秒、0.002 秒 |
+| テンソル 1 本、エキスパート 512 個 → IQ3_XXS | 20 秒（起動込み 32 秒） | 2 秒（起動込み 14 秒） |
+| 1 層（エキスパート 3 本を IQ3_XXS、行列 13 本を Q8_0） | 60 秒（起動込み 72 秒） | 3 秒（起動込み 15 秒）、`cmp` で同じ |
+| モデル全体、A の割り振り（エキスパート IQ2_XXS / IQ3_XXS、残り Q8_0、118 GiB の層ごとの埋め込み表 IQ4_NL） | 51 分 33 秒（llama-quantize） | 5 分 22 秒、1,380 本すべてのテンソルが同じ |
+
+起動の時間は、0.8 GB の imatrix を読み、元のファイルを開く時間です。
+
 ## 🧠 仕組み
 
-- **同じコード**：GPU の 1 スレッドが、256 個の重みのまとまり 1 つを担当します。中身は ggml の `quantize_row_*_impl` を 1 行ずつ写したものです。
+- **同じコード**：GPU の 1 スレッドが、256 個の重みのまとまり 1 つ（Q8_0 / IQ4_NL は 32 個）を担当します。i-quant は ggml の `quantize_row_*_impl` を 1 行ずつ写したもの、k-quant は ggml の計算の意味（演算と足し算の順番、imatrix が無いときの `*_ref` の探索）どおりに書いたものです。
 - **同じ表**：`gpuq/gpuq_tables.c` は `ggml-quants.c` そのものを取り込み、`iq2xs_init_impl` が作る grid、map、近傍の表を書き出します。
 - **同じ計算**：
   - llama.cpp の `libggml-base` は FMA を使わずにビルドされています。
@@ -538,9 +553,9 @@ GPU の時間の約半分は、float の重みを PCIe で送る時間です。
 
 ## ⚠️ 制限
 
-- **型**：GPU で計算するのは IQ1_S、IQ1_M、IQ2_XXS、IQ2_XS、IQ2_S、IQ3_XXS、IQ3_S、IQ4_XS、IQ4_NL です。k-quant（Q2_K〜Q6_K）は、ggml を通して CPU で計算します。元の重みを GPU で float に戻せるのは、F32、F16、BF16、Q8_0、MXFP4 です。
+- **型**：GPU で計算するのは IQ1_S、IQ1_M、IQ2_XXS、IQ2_XS、IQ2_S、IQ3_XXS、IQ3_S、IQ4_XS、IQ4_NL、Q2_K、Q3_K、Q4_K、Q5_K、Q6_K、Q8_0 です。それ以外の型（行の長さが合わないときの代わりの Q4_0、Q5_0、Q5_1 など）は、ggml を通して CPU で計算します。元の重みを GPU で float に戻せるのは、F32、F16、BF16、Q8_0、MXFP4 です。
 - **モデル**：MoE のエキスパートだけが対象です。代わりの型になるテンソルとその理由は、[対応するモデル](#-対応するモデル)を見てください。
-- **CUDA**：RTX 5090（sm_120、CUDA 13）で確かめました。9 つの型すべてと、GPU で読む元の型が ggml とバイト単位で一致し、LDLQ のループのテストも通ります。
+- **CUDA**：RTX 5090（sm_120、CUDA 13）で確かめました。15 の型すべてと、GPU で読む元の型が ggml とバイト単位で一致し、LDLQ のループのテストも通ります。k-quant と Q8_0 は ROCm ではまだ確かめていません（`./setup.sh` の自己テストでわかります）。
 - **LDLQ**：GPU で回すには、GPU 版の torch が要ります（`./setup.sh --torch-gpu`）。無い場合は `--dump-device=cpu` で同じ処理を CPU で回せますが、かなり遅くなります。校正データで 64 行に満たないエキスパートは、普通の丸めになります。
 - **環境**：確かめたのは x86-64 の Linux だけです。
   - ARM では gcc がふつうに FMA を使うので、ggml の CPU の出力そのものが変わります。
