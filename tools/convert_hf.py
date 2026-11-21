@@ -1,10 +1,11 @@
 """Converts a Hugging Face model (safetensors: BF16, F16, FP8) straight to a quantized GGUF, with no full-size
 intermediate file: llama.cpp's own converter (convert_hf_to_gguf.py and its conversion/ classes) reads the model, names
 the tensors and writes the metadata and tokenizer; just before each tensor is written, the tensors your rules file
-names are quantized (the i-quants on the GPU with --gpu, the rest through ggml on the CPU). Every architecture
+names are quantized - on the GPU by default (gpuq: the i-quants, the k-quants and Q8_0, byte-identical to ggml; --gpu=N
+picks the device, --cpu forces ggml on the CPU, and without a built gpuq library or a GPU it says so and uses the CPU). Every architecture
 llama.cpp converts works here as soon as llama.cpp does: update llama.cpp, run ./setup.sh.
 
-usage: convert_hf.py <hf model folder> <out.gguf> [--rules=<file>] [--imatrix=<imatrix.gguf>] [--gpu[=<device>]]
+usage: convert_hf.py <hf model folder> <out.gguf> [--rules=<file>] [--imatrix=<imatrix.gguf>] [--gpu=<device>] [--cpu]
                      [--outtype=bf16|q8_0|f16] [--split-max-size=50G] [--llama=<llama.cpp folder>] [--dry-run]
   --outtype   what tensors no rule names become (llama.cpp's converter decides which stay F32: norms, routers ...);
               default q8_0
@@ -18,7 +19,7 @@ The usual way for a new model (no GGUF published yet):
   1. convert_hf.py <hf folder> <first.gguf> --outtype=q8_0 --split-max-size=50G
      (or, when even Q8_0 does not fit your SSD: --rules with iq4_xs for the experts, which needs no imatrix)
   2. tools/imatrix.py run <first shard 1> calib.txt imatrix.gguf
-  3. convert_hf.py <hf folder> <final.gguf> --rules=<file> --imatrix=imatrix.gguf --gpu --split-max-size=50G
+  3. convert_hf.py <hf folder> <final.gguf> --rules=<file> --imatrix=imatrix.gguf --split-max-size=50G
      (from the original weights again, so no rounding is added twice); delete first.gguf
 Needs torch, transformers and sentencepiece in the venv (./setup.sh installs them).
 """
@@ -39,8 +40,8 @@ if _LLAMA:
     os.environ["GGUF_PY"] = os.path.join(_LLAMA, "gguf-py")
     for _m in [m for m in sys.modules if m == "gguf" or m.startswith("gguf.") or m == "requant_experts"]:
         del sys.modules[_m]
-from requant_experts import (_env, LIBGGML, NEEDS_IMATRIX, Q, TypeTraits, fit_type, gguf, np,  # noqa: E402
-                             read_imatrix, read_rules)
+from requant_experts import (LIBGGML, NEEDS_IMATRIX, Q, TypeTraits, fit_type, gguf, np,  # noqa: E402
+                             gpuq_takes, load_gpuq, read_imatrix, read_rules)
 
 CUR = threading.local()   # the GGUF name of the tensor llama.cpp's converter is about to quantize
 
@@ -83,17 +84,9 @@ def main() -> int:
     lib.ggml_quantize_init.argtypes = [ctypes.c_int]
     lib.ggml_get_type_traits.restype = ctypes.POINTER(TypeTraits)
     lib.ggml_get_type_traits.argtypes = [ctypes.c_int]
-    gq = None
-    if "--gpu" in flags:
-        here = os.environ.get("GPUQ_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "gpuq"))
-        gq = ctypes.CDLL(os.path.join(here, _env("GPUQ_LIB") or "libgpuq.so"))
-        gq.gpuq_init.argtypes = [ctypes.c_char_p, ctypes.c_int]
-        gq.gpuq_quantize.restype = ctypes.c_size_t
-        gq.gpuq_quantize.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64,
-                                     ctypes.c_void_p]
-        gq.gpuq_block_bytes.restype = ctypes.c_size_t
-        if gq.gpuq_init(os.path.join(here, "gpuq_tables.bin").encode(), int(flags["--gpu"] or 0)) != 0:
-            sys.exit("gpuq_init failed")
+    gq = None if "--cpu" in flags else load_gpuq(int(flags.get("--gpu") or 0))
+    gq_lock = threading.Lock()
+    batch_floats = int(os.environ.get("GPUQ_BATCH_MB", "2048")) << 18   # (MB of floats on the device a call)
     stats = {"gpu": 0, "cpu": 0}
 
     def quantize_array(a, typ, name):
@@ -106,11 +99,27 @@ def main() -> int:
         per = mats.shape[1] * ne0 // bs * ts
         outb = np.empty((mats.shape[0], per), dtype=np.uint8)
         lib.ggml_quantize_init(int(typ))
+        if gpuq_takes(gq, typ, im is not None) and gq.batch:   # (several slices a call, each its own imatrix row)
+            nm, rows = mats.shape[0], mats.shape[1]
+            imb = None if im is None else np.ascontiguousarray(
+                im if len(im) == nm else np.broadcast_to(im[:1], (nm, ne0)), dtype=np.float32)
+            k = max(1, min(nm, batch_floats // max(1, rows * ne0)))
+            for e0 in range(0, nm, k):
+                e1 = min(nm, e0 + k)
+                with gq_lock:
+                    got = gq.gpuq_quantize_batch(int(typ), mats[e0].ctypes.data, outb[e0].ctypes.data, e1 - e0, rows,
+                                                 ne0, None if imb is None else imb[e0].ctypes.data)
+                if got != per * (e1 - e0):
+                    raise RuntimeError("%s slices %d-%d: gpuq wrote %d bytes, expected %d" % (name, e0, e1 - 1, got,
+                                                                                         per * (e1 - e0)))
+                stats["gpu"] += e1 - e0
+            return outb.reshape(*a.shape[:-1], ne0 // bs * ts)
         for e in range(mats.shape[0]):
             w = None if im is None else np.ascontiguousarray(im[e if len(im) > 1 else 0], dtype=np.float32)
-            if gq is not None and w is not None and gq.gpuq_block_bytes(int(typ)) > 0:
-                got = gq.gpuq_quantize(int(typ), mats[e].ctypes.data, outb[e].ctypes.data, mats.shape[1], ne0,
-                                       w.ctypes.data)
+            if gpuq_takes(gq, typ, w is not None):
+                with gq_lock:
+                    got = gq.gpuq_quantize(int(typ), mats[e].ctypes.data, outb[e].ctypes.data, mats.shape[1], ne0,
+                                           None if w is None else w.ctypes.data)
                 stats["gpu"] += 1
             else:
                 got = lib.ggml_quantize_chunk(int(typ), mats[e].ctypes.data, outb[e].ctypes.data, 0, mats.shape[1], ne0,

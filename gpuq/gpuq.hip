@@ -52,7 +52,7 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 enum { T_IQ2_XXS = 16, T_IQ2_XS = 17, T_IQ3_XXS = 18, T_IQ1_S = 19, T_IQ4_NL = 20, T_IQ3_S = 21, T_IQ2_S = 22,
-       T_IQ4_XS = 23, T_IQ1_M = 29 };
+       T_IQ4_XS = 23, T_IQ1_M = 29, T_Q8_0 = 8, T_Q2_K = 10, T_Q3_K = 11, T_Q4_K = 12, T_Q5_K = 13, T_Q6_K = 14 };
 
 typedef uint16_t ggml_half;
 struct block_iq2_xxs { ggml_half d; uint16_t qs[QK_K/8]; };
@@ -1311,8 +1311,12 @@ QD void iq4_nl_impl(const float * x, ggml_half * dh, uint8_t * q4, uint16_t * sc
     for (int ib = 0; ib < SB/block_size; ++ib) {
         const float * xb = x + ib*block_size;
         uint8_t * Lb = L + ib*block_size;
-        const float * qw = quant_weights + ib*block_size;
-        for (int j = 0; j < block_size; ++j) weight[j] = qw[j] * sqrtf(sigma2 + xb[j]*xb[j]);
+        if (quant_weights) {   // (no imatrix: x^2, as ggml)
+            const float * qw = quant_weights + ib*block_size;
+            for (int j = 0; j < block_size; ++j) weight[j] = qw[j] * sqrtf(sigma2 + xb[j]*xb[j]);
+        } else {
+            for (int j = 0; j < block_size; ++j) weight[j] = xb[j]*xb[j];
+        }
         float amax = 0, max = 0;
         for (int j = 0; j < block_size; ++j) {
             float ax = fabsf(xb[j]);
@@ -1395,11 +1399,452 @@ QD void q_iq4_nl(const float * xbl, const float * qwbl, block_iq4_nl * y, Tab) {
 
 // ---------------------------------------------------------------- kernels and the C API
 QD float fp16_to_fp32(uint16_t h);
+
+// ---------------------------------------------------------------- k-quants (Q2_K .. Q6_K) and Q8_0
+// One thread a 256-weight super-block (Q8_0: a 32-weight block). Written from ggml-quants.c's semantics: with an
+// imatrix the quantize_row_*_impl search (make_qkx3 / make_qx / make_qp), without one the *_ref search (make_qkx2 /
+// make_q3 / make_qx with x^2 weights), as ggml_quantize_chunk picks; Q8_0 never takes the imatrix. Every float
+// expression keeps ggml's operand order (left to right, no contraction: -fmad=false / -ffp-contract=off), every
+// accumulation runs in ggml's index order, and the integer narrowing (int8_t / uint8_t stores) is ggml's, so the
+// bytes match ggml_quantize_chunk.
+struct block_q2_K { uint8_t scales[QK_K/16]; uint8_t qs[QK_K/4]; ggml_half d; ggml_half dmin; };
+struct block_q3_K { uint8_t hmask[QK_K/8]; uint8_t qs[QK_K/4]; uint8_t scales[12]; ggml_half d; };
+struct block_q4_K { ggml_half d; ggml_half dmin; uint8_t scales[12]; uint8_t qs[QK_K/2]; };
+struct block_q5_K { ggml_half d; ggml_half dmin; uint8_t scales[12]; uint8_t qh[QK_K/8]; uint8_t qs[QK_K/2]; };
+struct block_q6_K { uint8_t ql[QK_K/2]; uint8_t qh[QK_K/4]; int8_t scales[QK_K/16]; ggml_half d; };
+struct block_q8_0 { ggml_half d; int8_t qs[32]; };
+static_assert(sizeof(block_q2_K) == 84, "q2_K");
+static_assert(sizeof(block_q3_K) == 110, "q3_K");
+static_assert(sizeof(block_q4_K) == 144, "q4_K");
+static_assert(sizeof(block_q5_K) == 176, "q5_K");
+static_assert(sizeof(block_q6_K) == 210, "q6_K");
+static_assert(sizeof(block_q8_0) == 34, "q8_0");
+
+// the importance of x[i] in the symmetric searches: the given weights, else x^2 (ggml's rmse_type 1, the only one
+// the k-quants use)
+QD float kw(const float * qw, const float * x, int i) { return qw ? qw[i] : x[i]*x[i]; }
+
+// symmetric levels L in [0, 2*nmax) around a signed scale, picked by weighted least squares over 19 trial scales
+QD float sym_levels(int n, int nmax, const float * x, int8_t * L, const float * qw) {
+    float amax = 0, max = 0;
+    for (int i = 0; i < n; ++i) {
+        const float ax = fabsf(x[i]);
+        if (ax > amax) { amax = ax; max = x[i]; }
+    }
+    if (amax < GROUP_MAX_EPS) {
+        for (int i = 0; i < n; ++i) L[i] = 0;
+        return 0.f;
+    }
+    float iscale = -nmax / max;
+    float sumlx = 0, suml2 = 0;
+    for (int i = 0; i < n; ++i) {
+        const int l = MAX(-nmax, MIN(nmax-1, nearest_int(iscale * x[i])));
+        L[i] = l + nmax;
+        const float w = kw(qw, x, i);
+        sumlx += w*x[i]*l;
+        suml2 += w*l*l;
+    }
+    float scale = suml2 ? sumlx/suml2 : 0.0f;
+    float best = scale * sumlx;
+    for (int is = -9; is <= 9; ++is) {
+        if (is == 0) continue;
+        iscale = -(nmax + 0.1f*is) / max;
+        sumlx = suml2 = 0;
+        for (int i = 0; i < n; ++i) {
+            const int l = MAX(-nmax, MIN(nmax-1, nearest_int(iscale * x[i])));
+            const float w = kw(qw, x, i);
+            sumlx += w*x[i]*l;
+            suml2 += w*l*l;
+        }
+        if (suml2 > 0 && sumlx*sumlx > best*suml2) {
+            for (int i = 0; i < n; ++i) L[i] = nmax + MAX(-nmax, MIN(nmax-1, nearest_int(iscale * x[i])));
+            scale = sumlx/suml2;
+            best = scale*sumlx;
+        }
+    }
+    return scale;
+}
+
+// Q3_K without an imatrix: 3-bit symmetric levels, then up to 5 coordinate-descent passes on x^2-weighted error
+QD float sym3_levels(int n, int nmax, const float * x, int8_t * L) {
+    float amax = 0, max = 0;
+    for (int i = 0; i < n; ++i) {
+        const float ax = fabsf(x[i]);
+        if (ax > amax) { amax = ax; max = x[i]; }
+    }
+    if (amax < GROUP_MAX_EPS) {
+        for (int i = 0; i < n; ++i) L[i] = 0;
+        return 0.f;
+    }
+    const float iscale = -nmax / max;
+    float sumlx = 0, suml2 = 0;
+    for (int i = 0; i < n; ++i) {
+        const int l = MAX(-nmax, MIN(nmax-1, nearest_int(iscale * x[i])));
+        L[i] = l;
+        const float w = x[i]*x[i];
+        sumlx += w*x[i]*l;
+        suml2 += w*l*l;
+    }
+    for (int pass = 0; pass < 5; ++pass) {
+        int changed = 0;
+        for (int i = 0; i < n; ++i) {
+            const float w = x[i]*x[i];
+            float slx = sumlx - w*x[i]*L[i];
+            if (!(slx > 0)) continue;
+            float sl2 = suml2 - w*L[i]*L[i];
+            const int nl = MAX(-nmax, MIN(nmax-1, nearest_int(x[i] * sl2 / slx)));
+            if (nl == L[i]) continue;
+            slx += w*x[i]*nl;
+            sl2 += w*nl*nl;
+            if (sl2 > 0 && slx*slx*suml2 > sumlx*sumlx*sl2) {
+                L[i] = nl; sumlx = slx; suml2 = sl2;
+                ++changed;
+            }
+        }
+        if (!changed) break;
+    }
+    for (int i = 0; i < n; ++i) L[i] += nmax;
+    return suml2 > 0.0f ? sumlx / suml2 : 0.0f;
+}
+
+// affine levels L in [0, nmax] (x ~ scale*L - the_min), searching nstep+1 trial scales. `with_imatrix` selects ggml's
+// two variants: the imatrix one (make_qkx3: guarded rounding, max <= min check, weights may be absent) and the
+// plain one (make_qkx2: optional absolute error)
+template <bool with_imatrix>
+QD float affine_levels(int n, int nmax, const float * x, const float * weights, uint8_t * L, float * the_min,
+                       uint8_t * Laux, float rmin, float rdelta, int nstep, bool use_mad) {
+    float min = x[0], max = x[0];
+    float sum_w = with_imatrix ? kw(weights, x, 0) : weights[0];
+    float sum_x = sum_w * x[0];
+    for (int i = 1; i < n; ++i) {
+        if (x[i] < min) min = x[i];
+        if (x[i] > max) max = x[i];
+        const float w = with_imatrix ? kw(weights, x, i) : weights[i];
+        sum_w += w;
+        sum_x += w * x[i];
+    }
+    if (min > 0) min = 0;
+    if (with_imatrix ? max <= min : max == min) {
+        for (int i = 0; i < n; ++i) L[i] = 0;
+        *the_min = -min;
+        return 0.f;
+    }
+    float iscale = nmax/(max - min);
+    float scale = 1/iscale;
+    float best = 0;
+    for (int i = 0; i < n; ++i) {
+        L[i] = MAX(0, MIN(nmax, nearest_int(iscale*(x[i] - min))));
+        float diff = scale * L[i] + min - x[i];
+        diff = use_mad ? fabsf(diff) : diff*diff;
+        const float w = with_imatrix ? kw(weights, x, i) : weights[i];
+        best += w * diff;
+    }
+    if (nstep < 1) {
+        *the_min = -min;
+        return scale;
+    }
+    for (int is = 0; is <= nstep; ++is) {
+        iscale = (rmin + rdelta*is + nmax)/(max - min);
+        float sum_l = 0, sum_l2 = 0, sum_xl = 0;
+        for (int i = 0; i < n; ++i) {
+            int l;
+            if (with_imatrix) {
+                const float v = iscale*(x[i] - min);
+                l = v > 0 ? nearest_int(v < nmax ? v : (float) nmax) : 0;
+            } else {
+                l = MAX(0, MIN(nmax, nearest_int(iscale*(x[i] - min))));
+            }
+            Laux[i] = l;
+            const float w = with_imatrix ? kw(weights, x, i) : weights[i];
+            sum_l += w*l;
+            sum_l2 += w*l*l;
+            sum_xl += w*l*x[i];
+        }
+        const float D = sum_w * sum_l2 - sum_l * sum_l;
+        if (!(D > 0)) continue;
+        float this_scale = (sum_w * sum_xl - sum_x * sum_l)/D;
+        float this_min = (sum_l2 * sum_x - sum_l * sum_xl)/D;
+        if (this_min > 0) {
+            this_min = 0;
+            this_scale = sum_xl / sum_l2;
+        }
+        float err = 0;
+        for (int i = 0; i < n; ++i) {
+            float diff = this_scale * Laux[i] + this_min - x[i];
+            diff = use_mad ? fabsf(diff) : diff*diff;
+            const float w = with_imatrix ? kw(weights, x, i) : weights[i];
+            err += w * diff;
+        }
+        if (err < best) {
+            for (int i = 0; i < n; ++i) L[i] = Laux[i];
+            best = err;
+            scale = this_scale;
+            min = this_min;
+        }
+    }
+    *the_min = -min;
+    return scale;
+}
+
+// 2-bit fields of four 32-apart weights in one byte, 128 weights a 32-byte row (Q2_K and Q3_K's low bits)
+QD void pack_2bit(const uint8_t * L, uint8_t * qs) {
+    for (int base = 0; base < QK_K; base += 128)
+        for (int l = 0; l < 32; ++l)
+            qs[base/4 + l] = L[base + l] | (L[base + l + 32] << 2) | (L[base + l + 64] << 4) | (L[base + l + 96] << 6);
+}
+
+// Q4_K / Q5_K's 12 scale bytes: eight 6-bit scales and eight 6-bit mins
+QD void pack_scales_k4(const uint8_t * ls, const uint8_t * lm, uint8_t * s) {
+    for (int j = 0; j < 4; ++j) { s[j] = ls[j]; s[j + 4] = lm[j]; }
+    for (int j = 4; j < 8; ++j) {
+        s[j + 4] = (ls[j] & 0xF) | ((lm[j] & 0xF) << 4);
+        s[j - 4] |= (ls[j] >> 4) << 6;
+        s[j] |= (lm[j] >> 4) << 6;
+    }
+}
+QD void unpack_scale_k4(int j, const uint8_t * s, uint8_t * sc, uint8_t * m) {
+    if (j < 4) { *sc = s[j] & 63; *m = s[j + 4] & 63; }
+    else { *sc = (s[j + 4] & 0xF) | ((s[j - 4] >> 6) << 4); *m = (s[j + 4] >> 4) | ((s[j] >> 6) << 4); }
+}
+
+// the final rounding of the affine k-quants against the stored (fp16) scales: groups of g weights
+QD void affine_round(const float * x, uint8_t * L, int g, int ng, int nmax, float d, float dmin, const uint8_t * sc,
+                     const uint8_t * mn) {
+    for (int j = 0; j < ng; ++j) {
+        const float dj = d * sc[j];
+        if (!dj) continue;
+        const float mj = dmin * mn[j];
+        for (int i = 0; i < g; ++i) L[g*j + i] = MAX(0, MIN(nmax, nearest_int((x[g*j + i] + mj)/dj)));
+    }
+}
+
+QD void q_q2_k(const float * x, const float * qw, block_q2_K * y, Tab) {
+    uint8_t L[QK_K], Laux[16], Ls[16], Lm[16];
+    float scales[16], mins[16], w[16];
+    if (!qw) {
+        float max_scale = 0, max_min = 0;
+        for (int j = 0; j < 16; ++j) {
+            for (int l = 0; l < 16; ++l) w[l] = fabsf(x[16*j + l]);
+            scales[j] = affine_levels<false>(16, 3, x + 16*j, w, L + 16*j, &mins[j], Laux, -0.5f, 0.1f, 15, true);
+            if (scales[j] > max_scale) max_scale = scales[j];
+            if (mins[j] > max_min) max_min = mins[j];
+        }
+        for (int j = 0; j < 16; ++j) y->scales[j] = 0;
+        if (max_scale > 0) {
+            const float is = 15.f/max_scale;
+            for (int j = 0; j < 16; ++j) y->scales[j] = nearest_int(is*scales[j]);
+            y->d = fp32_to_fp16(max_scale/15.f);
+        } else {
+            y->d = fp32_to_fp16(0.f);
+        }
+        if (max_min > 0) {
+            const float im = 15.f/max_min;
+            for (int j = 0; j < 16; ++j) y->scales[j] |= nearest_int(im*mins[j]) << 4;
+            y->dmin = fp32_to_fp16(max_min/15.f);
+        } else {
+            y->dmin = fp32_to_fp16(0.f);
+        }
+    } else {
+        float sumx2 = 0;
+        for (int j = 0; j < QK_K; ++j) sumx2 += x[j]*x[j];
+        const float sigma2 = sumx2/QK_K;
+        float sw[16];
+        for (int j = 0; j < 16; ++j) {
+            for (int l = 0; l < 16; ++l) w[l] = qw[16*j + l] * sqrtf(sigma2 + x[16*j + l]*x[16*j + l]);
+            sw[j] = 0;
+            for (int l = 0; l < 16; ++l) sw[j] += w[l];
+            scales[j] = affine_levels<true>(16, 3, x + 16*j, w, L + 16*j, &mins[j], Laux, -0.9f, 0.05f, 36, false);
+        }
+        const float dm = make_qp_quants(16, 15, scales, Ls, sw);
+        const float mm = make_qp_quants(16, 15, mins, Lm, sw);
+        y->d = fp32_to_fp16(dm);
+        y->dmin = fp32_to_fp16(mm);
+        for (int j = 0; j < 16; ++j) y->scales[j] = Ls[j] | (Lm[j] << 4);
+    }
+    uint8_t sc[16], mn[16];
+    for (int j = 0; j < 16; ++j) { sc[j] = y->scales[j] & 0xF; mn[j] = y->scales[j] >> 4; }
+    affine_round(x, L, 16, 16, 3, fp16_to_fp32(y->d), fp16_to_fp32(y->dmin), sc, mn);
+    pack_2bit(L, y->qs);
+}
+
+QD void q_q3_k(const float * x, const float * qw, block_q3_K * y, Tab) {
+    int8_t L[QK_K], Ls[16];
+    float scales[16];
+    for (int j = 0; j < 12; ++j) y->scales[j] = 0;
+    if (!qw) {
+        float amax = 0, max_scale = 0;
+        for (int j = 0; j < 16; ++j) {
+            scales[j] = sym3_levels(16, 4, x + 16*j, L + 16*j);
+            const float a = fabsf(scales[j]);
+            if (a > amax) { amax = a; max_scale = scales[j]; }
+        }
+        if (max_scale) {
+            const float iscale = -32.f/max_scale;
+            for (int j = 0; j < 16; ++j) {
+                int8_t l = nearest_int(iscale*scales[j]);   // (int8_t first, then the clamp: ggml's order)
+                Ls[j] = MAX(-32, MIN(31, l)) + 32;
+            }
+            y->d = fp32_to_fp16(1/iscale);
+        } else {
+            for (int j = 0; j < 16; ++j) Ls[j] = -1;     // (no scale bits written)
+            y->d = fp32_to_fp16(0.f);
+        }
+    } else {
+        float sumx2 = 0;
+        for (int j = 0; j < QK_K; ++j) sumx2 += x[j]*x[j];
+        const float sigma2 = 2*sumx2/QK_K;
+        float w[16], sw[16];
+        for (int j = 0; j < 16; ++j) {
+            for (int l = 0; l < 16; ++l) w[l] = qw[16*j + l] * sqrtf(sigma2 + x[16*j + l]*x[16*j + l]);
+            float s = 0;
+            for (int l = 0; l < 16; ++l) s += w[l];
+            sw[j] = s;
+            scales[j] = sym_levels(16, 4, x + 16*j, L + 16*j, w);
+        }
+        y->d = fp32_to_fp16(sym_levels(16, 32, scales, Ls, sw));
+    }
+    for (int j = 0; j < 16; ++j) {           // 6-bit scales: low nibbles in 0..7, the top 2 bits in 8..11
+        if (Ls[j] < 0) break;
+        const int l = Ls[j];
+        if (j < 8) y->scales[j] = l & 0xF; else y->scales[j - 8] |= (l & 0xF) << 4;
+        y->scales[j%4 + 8] |= (l >> 4) << (2*(j/4));
+    }
+    const float d = fp16_to_fp32(y->d);
+    for (int j = 0; j < 16; ++j) {
+        int8_t sc = j < 8 ? y->scales[j] & 0xF : y->scales[j - 8] >> 4;
+        sc = (sc | (((y->scales[8 + j%4] >> (2*(j/4))) & 3) << 4)) - 32;
+        const float dj = d * sc;
+        if (!dj) continue;
+        for (int i = 0; i < 16; ++i) L[16*j + i] = MAX(-4, MIN(3, nearest_int(x[16*j + i]/dj))) + 4;
+    }
+    for (int j = 0; j < QK_K/8; ++j) y->hmask[j] = 0;
+    for (int j = 0; j < QK_K; ++j)           // the high bit of weight j: byte j % 32, bit j / 32
+        if (L[j] > 3) { y->hmask[j % 32] |= 1 << (j / 32); L[j] -= 4; }
+    pack_2bit((const uint8_t *) L, y->qs);
+}
+
+// Q4_K and Q5_K share everything but the level count and the plain search's trial range
+template <int NMAX, typename B>
+QD void q_affine32(const float * x, const float * qw, B * y, uint8_t * L, float rmin_plain, int nstep_plain) {
+    uint8_t Laux[32], ls[8], lm[8];
+    float scales[8], mins[8], w[32];
+    if (!qw) {
+        float max_scale = 0, max_min = 0;
+        for (int j = 0; j < 8; ++j) {
+            float s2 = 0;
+            for (int l = 0; l < 32; ++l) s2 += x[32*j + l] * x[32*j + l];
+            const float av = sqrtf(s2/32);
+            for (int l = 0; l < 32; ++l) w[l] = av + fabsf(x[32*j + l]);
+            scales[j] = affine_levels<false>(32, NMAX, x + 32*j, w, L + 32*j, &mins[j], Laux, rmin_plain, 0.1f,
+                                             nstep_plain, false);
+            if (scales[j] > max_scale) max_scale = scales[j];
+            if (mins[j] > max_min) max_min = mins[j];
+        }
+        const float is = max_scale > 0 ? 63.f/max_scale : 0.f;
+        const float im = max_min > 0 ? 63.f/max_min : 0.f;
+        for (int j = 0; j < 8; ++j) {
+            const uint8_t a = nearest_int(is*scales[j]), b = nearest_int(im*mins[j]);
+            ls[j] = MIN(63, a);
+            lm[j] = MIN(63, b);
+        }
+        y->d = fp32_to_fp16(max_scale/63.f);
+        y->dmin = fp32_to_fp16(max_min/63.f);
+    } else {
+        float s2 = 0;
+        for (int l = 0; l < QK_K; ++l) s2 += x[l] * x[l];
+        const float sigma2 = 2*s2/QK_K;
+        float sw[8];
+        for (int j = 0; j < 8; ++j) {
+            for (int l = 0; l < 32; ++l) w[l] = qw[32*j + l] * sqrtf(sigma2 + x[32*j + l]*x[32*j + l]);
+            float s = 0;
+            for (int l = 0; l < 32; ++l) s += w[l];
+            sw[j] = s;
+            scales[j] = affine_levels<true>(32, NMAX, x + 32*j, w, L + 32*j, &mins[j], Laux, -0.9f, 0.05f, 36, false);
+        }
+        const float db = make_qp_quants(8, 63, scales, ls, sw);
+        const float mb = make_qp_quants(8, 63, mins, lm, sw);
+        if (NMAX == 31) for (int j = 0; j < 8; ++j) { ls[j] = MIN(63, ls[j]); lm[j] = MIN(63, lm[j]); }   // (Q5_K)
+        y->d = fp32_to_fp16(db);
+        y->dmin = fp32_to_fp16(mb);
+    }
+    pack_scales_k4(ls, lm, y->scales);
+    uint8_t sc[8], mn[8];
+    for (int j = 0; j < 8; ++j) unpack_scale_k4(j, y->scales, &sc[j], &mn[j]);
+    affine_round(x, L, 32, 8, NMAX, fp16_to_fp32(y->d), fp16_to_fp32(y->dmin), sc, mn);
+}
+
+QD void q_q4_k(const float * x, const float * qw, block_q4_K * y, Tab) {
+    uint8_t L[QK_K];
+    q_affine32<15>(x, qw, y, L, -1.f, 20);
+    for (int base = 0, o = 0; base < QK_K; base += 64, o += 32)
+        for (int l = 0; l < 32; ++l) y->qs[o + l] = L[base + l] | (L[base + l + 32] << 4);
+}
+
+QD void q_q5_k(const float * x, const float * qw, block_q5_K * y, Tab) {
+    uint8_t L[QK_K];
+    q_affine32<31>(x, qw, y, L, -0.5f, 15);
+    for (int j = 0; j < QK_K/8; ++j) y->qh[j] = 0;
+    for (int base = 0, o = 0, bit = 0; base < QK_K; base += 64, o += 32, bit += 2)
+        for (int j = 0; j < 32; ++j) {
+            int a = L[base + j], b = L[base + j + 32];
+            if (a > 15) { a -= 16; y->qh[j] |= 1 << bit; }
+            if (b > 15) { b -= 16; y->qh[j] |= 2 << bit; }
+            y->qs[o + j] = a | (b << 4);
+        }
+}
+
+QD void q_q6_k(const float * x, const float * qw, block_q6_K * y, Tab) {
+    int8_t L[QK_K];
+    float scales[16];
+    float amax = 0, max_scale = 0;
+    for (int b = 0; b < 16; ++b) {      // (ggml's impl hands the imatrix straight in; without one: x^2)
+        scales[b] = sym_levels(16, 32, x + 16*b, L + 16*b, qw ? qw + 16*b : nullptr);
+        const float a = fabsf(scales[b]);
+        if (a > amax) { amax = a; max_scale = scales[b]; }
+    }
+    if (amax < GROUP_MAX_EPS) {
+        uint8_t * p = (uint8_t *) y;
+        for (size_t i = 0; i < sizeof(block_q6_K); ++i) p[i] = 0;
+        return;
+    }
+    const float iscale = -128.f/max_scale;
+    y->d = fp32_to_fp16(1/iscale);
+    for (int b = 0; b < 16; ++b) y->scales[b] = MIN(127, nearest_int(iscale*scales[b]));
+    const float d = fp16_to_fp32(y->d);
+    for (int j = 0; j < 16; ++j) {
+        const float dj = d * y->scales[j];
+        if (!dj) continue;
+        for (int i = 0; i < 16; ++i) L[16*j + i] = MAX(-32, MIN(31, nearest_int(x[16*j + i]/dj))) + 32;
+    }
+    for (int half = 0; half < 2; ++half) {
+        const int8_t * Lh = L + 128*half;
+        uint8_t * ql = y->ql + 64*half;
+        uint8_t * qh = y->qh + 32*half;
+        for (int l = 0; l < 32; ++l) {
+            ql[l] = (Lh[l] & 0xF) | ((Lh[l + 64] & 0xF) << 4);
+            ql[l + 32] = (Lh[l + 32] & 0xF) | ((Lh[l + 96] & 0xF) << 4);
+            qh[l] = (Lh[l] >> 4) | ((Lh[l + 32] >> 4) << 2) | ((Lh[l + 64] >> 4) << 4) | ((Lh[l + 96] >> 4) << 6);
+        }
+    }
+}
+
+QD void q_q8_0(const float * x, const float *, block_q8_0 * y, Tab) {
+    float amax = 0.0f;
+    for (int j = 0; j < 32; ++j) amax = MAX(amax, fabsf(x[j]));
+    const float d = amax / 127;
+    const float id = d ? 1.0f/d : 0.0f;
+    y->d = fp32_to_fp16(d);
+    for (int j = 0; j < 32; ++j) y->qs[j] = roundf(x[j]*id);
+}
+
 template <typename B, void (*Q)(const float *, const float *, B *, Tab), int BS = QK_K>
-__global__ void kq(const float * x, const float * qw, B * y, int64_t nblocks, int64_t qw_mod, int64_t qw_div, Tab t) {
+__global__ void kq(const float * x, const float * qw, B * y, int64_t nblocks, int64_t qw_mod, int64_t qw_div, Tab t,
+                   int64_t qw_mat = INT64_MAX) {
+    // block b's importance: imatrix row b / qw_mat (one a matrix of a batch), block (b % qw_mod) / qw_div in it;
+    // qw == nullptr: none (the k-quants and Q8_0 then take ggml's no-imatrix path)
     const int64_t b = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= nblocks) return;
-    Q(x + b*BS, qw + ((b % qw_mod) / qw_div)*BS, y + b, t);
+    Q(x + b*BS, qw ? qw + ((b / qw_mat) * qw_mod + (b % qw_mod) / qw_div)*BS : nullptr, y + b, t);
 }
 
 // ---------------------------------------------------------------- ggml's dequantizers (dequantize_row_iq*: ggml-quants.c)
@@ -1645,6 +2090,12 @@ extern "C" size_t gpuq_block_bytes(int type) {
         case T_IQ3_S:   return sizeof(block_iq3_s);
         case T_IQ4_NL:  return sizeof(block_iq4_nl);
         case T_IQ4_XS:  return sizeof(block_iq4_xs);
+        case T_Q2_K:    return sizeof(block_q2_K);
+        case T_Q3_K:    return sizeof(block_q3_K);
+        case T_Q4_K:    return sizeof(block_q4_K);
+        case T_Q5_K:    return sizeof(block_q5_K);
+        case T_Q6_K:    return sizeof(block_q6_K);
+        case T_Q8_0:    return sizeof(block_q8_0);
         default:        return 0;
     }
 }
@@ -1702,27 +2153,50 @@ size_t raw_bytes(int src, int64_t n) {
     }
 }
 
-// the quantize kernels over g_x (nrow x n_per_row floats already on the GPU) into dst
-size_t quantize_gx(int type, void * dst, int64_t nrow, int64_t n_per_row, const float * imatrix) {
+// the types quantized from no imatrix as well (the k-quants: ggml's *_ref path; IQ4_NL / IQ4_XS: x^2 weights); the
+// other i-quants here always take one
+bool kquant(int type) {
+    return type == T_Q2_K || type == T_Q3_K || type == T_Q4_K || type == T_Q5_K || type == T_Q6_K || type == T_Q8_0 ||
+           type == T_IQ4_NL || type == T_IQ4_XS;
+}
+int block_len(int type) { return type == T_IQ4_NL || type == T_Q8_0 ? 32 : QK_K; }
+
+// the quantize kernels over g_x (nmat matrices of nrow x n_per_row floats already on the GPU) into dst; imatrix:
+// nmat rows of n_per_row (matrix m takes row m), or nullptr
+size_t quantize_gx(int type, void * dst, int64_t nmat, int64_t nrow, int64_t n_per_row, const float * imatrix) {
     const size_t bb = gpuq_block_bytes(type);
     const Tab t = tab_for(type);
-    const int bs = type == T_IQ4_NL ? QK4_NL : QK_K;
-    const int64_t nb_row = n_per_row / bs, nblocks = nrow * nb_row;
-    if (!grow(&g_y, &g_y_cap, nblocks * bb) || !grow((void **) &g_qw, &g_qw_cap, n_per_row * 4)) return 0;
-    if (hipMemcpy(g_qw, imatrix, n_per_row * 4, hipMemcpyHostToDevice) != hipSuccess) return 0;
+    const int bs = block_len(type);
+    const int64_t nb_row = n_per_row / bs, nb_mat = nrow * nb_row, nblocks = nmat * nb_mat;
+    if (!grow(&g_y, &g_y_cap, nblocks * bb)) return 0;
+    const float * qw = nullptr;
+    if (imatrix && type != T_Q8_0) {   // (Q8_0 ignores it, as ggml_quantize_chunk)
+        if (!grow((void **) &g_qw, &g_qw_cap, nmat * n_per_row * 4)) return 0;
+        if (hipMemcpy(g_qw, imatrix, nmat * n_per_row * 4, hipMemcpyHostToDevice) != hipSuccess) return 0;
+        qw = g_qw;
+    }
     const int th = 64;
     const dim3 grid((unsigned) ((nblocks + th - 1) / th));
+#define KQ(B, F, ...) kq<B, F, ##__VA_ARGS__><<<grid, th>>>(g_x, qw, (B *) g_y, nblocks, nb_row, 1, t, nb_mat)
     switch (type) {
-        case T_IQ2_XXS: kq<block_iq2_xxs, q_iq2_xxs><<<grid, th>>>(g_x, g_qw, (block_iq2_xxs *) g_y, nblocks, nb_row, 1, t); break;
-        case T_IQ2_S:   kq<block_iq2_s,   q_iq2_s  ><<<grid, th>>>(g_x, g_qw, (block_iq2_s *) g_y, nblocks, nb_row, 1, t); break;
-        case T_IQ1_S:   kq<block_iq1_s,   q_iq1_s  ><<<grid, th>>>(g_x, g_qw, (block_iq1_s *) g_y, nblocks, nb_row, 1, t); break;
-        case T_IQ1_M:   kq<block_iq1_m,   q_iq1_m  ><<<grid, th>>>(g_x, g_qw, (block_iq1_m *) g_y, nblocks, nb_row, 1, t); break;
-        case T_IQ2_XS:  kq<block_iq2_xs,  q_iq2_xs ><<<grid, th>>>(g_x, g_qw, (block_iq2_xs *) g_y, nblocks, nb_row, 1, t); break;
-        case T_IQ3_XXS: kq<block_iq3_xxs, q_iq3_xxs><<<grid, th>>>(g_x, g_qw, (block_iq3_xxs *) g_y, nblocks, nb_row, 1, t); break;
-        case T_IQ3_S:   kq<block_iq3_s,   q_iq3_s  ><<<grid, th>>>(g_x, g_qw, (block_iq3_s *) g_y, nblocks, nb_row, 1, t); break;
-        case T_IQ4_XS:  kq<block_iq4_xs,  q_iq4_xs ><<<grid, th>>>(g_x, g_qw, (block_iq4_xs *) g_y, nblocks, nb_row, 1, t); break;
-        case T_IQ4_NL:  kq<block_iq4_nl,  q_iq4_nl, QK4_NL><<<grid, th>>>(g_x, g_qw, (block_iq4_nl *) g_y, nblocks, nb_row, 1, t); break;
+        case T_IQ2_XXS: KQ(block_iq2_xxs, q_iq2_xxs); break;
+        case T_IQ2_S:   KQ(block_iq2_s,   q_iq2_s  ); break;
+        case T_IQ1_S:   KQ(block_iq1_s,   q_iq1_s  ); break;
+        case T_IQ1_M:   KQ(block_iq1_m,   q_iq1_m  ); break;
+        case T_IQ2_XS:  KQ(block_iq2_xs,  q_iq2_xs ); break;
+        case T_IQ3_XXS: KQ(block_iq3_xxs, q_iq3_xxs); break;
+        case T_IQ3_S:   KQ(block_iq3_s,   q_iq3_s  ); break;
+        case T_IQ4_XS:  KQ(block_iq4_xs,  q_iq4_xs ); break;
+        case T_IQ4_NL:  KQ(block_iq4_nl,  q_iq4_nl, QK4_NL); break;
+        case T_Q2_K:    KQ(block_q2_K,    q_q2_k   ); break;
+        case T_Q3_K:    KQ(block_q3_K,    q_q3_k   ); break;
+        case T_Q4_K:    KQ(block_q4_K,    q_q4_k   ); break;
+        case T_Q5_K:    KQ(block_q5_K,    q_q5_k   ); break;
+        case T_Q6_K:    KQ(block_q6_K,    q_q6_k   ); break;
+        case T_Q8_0:    KQ(block_q8_0,    q_q8_0, 32); break;
+        default: return 0;
     }
+#undef KQ
     if (hipGetLastError() != hipSuccess || hipDeviceSynchronize() != hipSuccess) return 0;
     if (hipMemcpy(dst, g_y, nblocks * bb, hipMemcpyDeviceToHost) != hipSuccess) return 0;
     return nblocks * bb;
@@ -1730,18 +2204,31 @@ size_t quantize_gx(int type, void * dst, int64_t nrow, int64_t n_per_row, const 
 
 bool type_ok(int type, int64_t n_per_row, const float * imatrix) {
     const size_t bb = gpuq_block_bytes(type);
-    const bool tabless = type == T_IQ4_NL || type == T_IQ4_XS;
-    const int bs = type == T_IQ4_NL ? QK4_NL : QK_K;
-    return bb && (tabless || tab_for(type).grid) && imatrix && n_per_row % bs == 0;
+    const bool tabless = type == T_IQ4_NL || type == T_IQ4_XS || kquant(type);
+    return bb && (tabless || tab_for(type).grid) && (imatrix || kquant(type)) && n_per_row % block_len(type) == 0;
 }
+}
+
+// 1 when gpuq_quantize* takes this type (with an imatrix: with_imatrix = 1; without one: 0)
+extern "C" int gpuq_can_quantize(int type, int with_imatrix) {
+    return type_ok(type, block_len(type), with_imatrix ? (const float *) 1 : nullptr) ? 1 : 0;
+}
+
+// nmat matrices [nrow x n_per_row] f32 (host) -> dst, matrix m weighted by imatrix row m (imatrix: nmat x n_per_row,
+// or nullptr for the k-quants / Q8_0); one launch for the batch (e.g. a few dozen experts of a tensor at once)
+extern "C" size_t gpuq_quantize_batch(int type, const float * src, void * dst, int64_t nmat, int64_t nrow,
+                                      int64_t n_per_row, const float * imatrix) {
+    if (nmat <= 0 || !type_ok(type, n_per_row, imatrix)) return 0;
+    const size_t n = (size_t) nmat * nrow * n_per_row;
+    if (!grow((void **) &g_x, &g_x_cap, n * 4)) return 0;
+    if (hipMemcpy(g_x, src, n * 4, hipMemcpyHostToDevice) != hipSuccess) return 0;
+    return quantize_gx(type, dst, nmat, nrow, n_per_row, imatrix);
 }
 
 extern "C" size_t gpuq_quantize(int type, const float * src, void * dst, int64_t nrow, int64_t n_per_row,
                                 const float * imatrix) {
     if (!type_ok(type, n_per_row, imatrix)) return 0;
-    if (!grow((void **) &g_x, &g_x_cap, (size_t) nrow * n_per_row * 4)) return 0;
-    if (hipMemcpy(g_x, src, (size_t) nrow * n_per_row * 4, hipMemcpyHostToDevice) != hipSuccess) return 0;
-    return quantize_gx(type, dst, nrow, n_per_row, imatrix);
+    return gpuq_quantize_batch(type, src, dst, 1, nrow, n_per_row, imatrix);
 }
 
 // 1 when gpuq_requantize can read this ggml type (F32, F16, BF16, Q8_0, MXFP4)
@@ -1749,17 +2236,22 @@ extern "C" int gpuq_can_dequantize(int src) { return raw_bytes(src, 32) > 0; }
 
 // the source tensor's raw bytes (ggml type src) -> floats on the GPU -> type; the same bytes as ggml's to_float then
 // ggml_quantize_chunk, with 1/8 (MXFP4) to 1/2 (F16) of the host-to-GPU traffic of gpuq_quantize and no CPU work
-extern "C" size_t gpuq_requantize(int src, const void * raw, int type, void * dst, int64_t nrow, int64_t n_per_row,
-                                  const float * imatrix) {
-    const int64_t n = nrow * n_per_row;
+extern "C" size_t gpuq_requantize_batch(int src, const void * raw, int type, void * dst, int64_t nmat, int64_t nrow,
+                                        int64_t n_per_row, const float * imatrix) {
+    const int64_t n = nmat * nrow * n_per_row;
     const size_t rb = raw_bytes(src, n);
-    if (!rb || n % 32 || !type_ok(type, n_per_row, imatrix)) return 0;
+    if (nmat <= 0 || !rb || n % 32 || !type_ok(type, n_per_row, imatrix)) return 0;
     if (!grow((void **) &g_raw, &g_raw_cap, rb) || !grow((void **) &g_x, &g_x_cap, (size_t) n * 4)) return 0;
     if (hipMemcpy(g_raw, raw, rb, hipMemcpyHostToDevice) != hipSuccess) return 0;
     const int th = 128;
     kdq<<<(unsigned) ((n/32 + th - 1) / th), th>>>(src, g_raw, g_x, n);
     if (hipGetLastError() != hipSuccess) return 0;
-    return quantize_gx(type, dst, nrow, n_per_row, imatrix);
+    return quantize_gx(type, dst, nmat, nrow, n_per_row, imatrix);
+}
+
+extern "C" size_t gpuq_requantize(int src, const void * raw, int type, void * dst, int64_t nrow, int64_t n_per_row,
+                                  const float * imatrix) {
+    return gpuq_requantize_batch(src, raw, type, dst, 1, nrow, n_per_row, imatrix);
 }
 
 // ---------------------------------------------------------------- device-pointer API (the caller's stream, no sync)

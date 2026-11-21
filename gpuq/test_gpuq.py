@@ -1,10 +1,12 @@
 """gpuq/test_gpuq.py (trench-gguf) - the GPU quantizer (libgpuq.so) against ggml_quantize_chunk, byte for byte.
 
-    test_gpuq.py <gguf shard> <imatrix.gguf> [--tensor=<regex>] [--experts=N] [--types=iq1_s,iq1_m,...]
+    test_gpuq.py <gguf shard> <imatrix.gguf> [--tensor=<regex>] [--experts=N] [--types=iq1_s,iq1_m,...,q4_k,q8_0]
     test_gpuq.py --selftest [--types=...]      (no model files: random weights, a coarse 4-bit-like copy with many
                                                 equal values, and a random imatrix)
 
-Also checks reading the source on the GPU (gpuq_requantize: F16 / BF16 / Q8_0 / MXFP4 bytes -> IQ2_XXS).
+The k-quants (Q2_K .. Q6_K) are checked with the imatrix and without one (ggml's two code paths), Q8_0 without
+(ggml ignores the imatrix for it). Also checks a batch of all N matrices in one call (gpuq_quantize_batch) and reading
+the source on the GPU (gpuq_requantize: F16 / BF16 / Q8_0 / MXFP4 bytes -> IQ2_XXS).
 Takes the first tensor matching --tensor (an expert tensor, ne2 experts), dequantizes N experts with ggml's to_float,
 quantizes each to every type on the CPU (ggml) and on the GPU, and prints the share of identical blocks and the time.
 """
@@ -27,7 +29,8 @@ def main():
         shard, imat_path = [a for a in sys.argv[1:] if not a.startswith("--")]
     pat = re.compile(flags.get("--tensor", r"ffn_gate_exps"))
     n_exp = int(flags.get("--experts", "4"))
-    types = flags.get("--types", "iq1_s,iq1_m,iq2_xxs,iq2_xs,iq2_s,iq3_xxs,iq3_s,iq4_xs,iq4_nl").split(",")
+    types = flags.get("--types", "iq1_s,iq1_m,iq2_xxs,iq2_xs,iq2_s,iq3_xxs,iq3_s,iq4_xs,iq4_nl,"
+                                 "q2_k,q3_k,q4_k,q5_k,q6_k,q8_0").split(",")
 
     lib = ctypes.CDLL(LIBGGML)
     lib.ggml_quantize_chunk.restype = ctypes.c_size_t
@@ -42,6 +45,9 @@ def main():
     gq.gpuq_quantize.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64,
                                  ctypes.c_void_p]
     gq.gpuq_block_bytes.restype = ctypes.c_size_t
+    gq.gpuq_quantize_batch.restype = ctypes.c_size_t
+    gq.gpuq_quantize_batch.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64,
+                                       ctypes.c_int64, ctypes.c_void_p]
     gq.gpuq_requantize.restype = ctypes.c_size_t
     gq.gpuq_requantize.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int64,
                                    ctypes.c_int64, ctypes.c_void_p]
@@ -54,7 +60,14 @@ def main():
         g = rng.standard_normal((ne1, ne0)).astype(np.float32) * 0.02
         coarse = (np.round(g / 0.005) * 0.005).astype(np.float32)          # ties, as MXFP4 / k-quant sources have
         heavy = (rng.standard_t(3, (ne1, ne0)) * 0.01).astype(np.float32)  # outliers
-        xs = [g.reshape(-1), coarse.reshape(-1), heavy.reshape(-1)]
+        edge = g.copy()                     # all-zero / constant / one-signed / tiny sub-blocks (the scale guards)
+        edge[0:8] = 0
+        edge[8:16, :1024] = 0.01
+        edge[16:32] = np.abs(edge[16:32])
+        edge[32:48] = -np.abs(edge[32:48])
+        edge[48:64] *= 1e-20
+        edge[64:80, ::16] = 0
+        xs = [g.reshape(-1), coarse.reshape(-1), heavy.reshape(-1), edge.reshape(-1)]
         imv = [rng.gamma(1.0, 1.0, ne0).astype(np.float32) for _ in xs]
         n_exp = len(xs)
         print("selftest: %d random matrices [%d x %d]" % (n_exp, ne0, ne1))
@@ -80,31 +93,51 @@ def main():
     for name in types:
         typ = Q[name.upper()]
         bb = gq.gpuq_block_bytes(int(typ))
+        blk = gguf.GGML_QUANT_SIZES[typ][0]
         lib.ggml_quantize_init(int(typ))
-        same = blocks = 0
-        tc = tg = 0.0
-        for e in range(n_exp):
-            nbytes = ne1 * (ne0 // (32 if name == "iq4_nl" else 256)) * bb
-            a = np.empty(nbytes, dtype=np.uint8)
-            b = np.empty(nbytes, dtype=np.uint8)
-            t0 = time.time()
-            got = lib.ggml_quantize_chunk(int(typ), xs[e].ctypes.data, a.ctypes.data, 0, ne1, ne0, imv[e].ctypes.data)
-            t1 = time.time()
-            got2 = gq.gpuq_quantize(int(typ), xs[e].ctypes.data, b.ctypes.data, ne1, ne0, imv[e].ctypes.data)
-            t2 = time.time()
-            assert got == nbytes and got2 == nbytes, (got, got2, nbytes)
-            tc += t1 - t0
-            tg += t2 - t1
-            ab, bb_ = a.reshape(-1, bb), b.reshape(-1, bb)
-            eq = np.all(ab == bb_, axis=1)
-            same += int(eq.sum())
-            blocks += len(eq)
-            if not eq.all() and e == 0:
-                i = int(np.argmin(eq))
-                print("   first differing block %d:\n   cpu %s\n   gpu %s" % (i, ab[i].tobytes().hex(), bb_[i].tobytes().hex()))
-        print("%-8s identical blocks %d / %d (%.4f%%)   cpu 1 thread %.2f s/expert, gpu %.3f s/expert (x%.0f)" %
-              (name, same, blocks, 100.0 * same / blocks, tc / n_exp, tg / n_exp, tc / max(tg, 1e-9)))
-        bad += blocks - same
+        kq = name.startswith("q") or name in ("iq4_nl", "iq4_xs")   # (also quantized without an imatrix)
+        modes = ([] if name == "q8_0" else [True]) + ([False] if kq else [])
+        for with_im in modes:
+            same = blocks = 0
+            tc = tg = 0.0
+            cpu_all = []
+            for e in range(n_exp):
+                nbytes = ne1 * (ne0 // blk) * bb
+                a = np.empty(nbytes, dtype=np.uint8)
+                b = np.empty(nbytes, dtype=np.uint8)
+                w = imv[e].ctypes.data if with_im else None
+                t0 = time.time()
+                got = lib.ggml_quantize_chunk(int(typ), xs[e].ctypes.data, a.ctypes.data, 0, ne1, ne0, w)
+                t1 = time.time()
+                got2 = gq.gpuq_quantize(int(typ), xs[e].ctypes.data, b.ctypes.data, ne1, ne0, w)
+                t2 = time.time()
+                assert got == nbytes and got2 == nbytes, (name, got, got2, nbytes)
+                tc += t1 - t0
+                tg += t2 - t1
+                cpu_all.append(a)
+                ab, bb_ = a.reshape(-1, bb), b.reshape(-1, bb)
+                eq = np.all(ab == bb_, axis=1)
+                same += int(eq.sum())
+                blocks += len(eq)
+                if not eq.all() and e == 0:
+                    i = int(np.argmin(eq))
+                    print("   first differing block %d:\n   cpu %s\n   gpu %s" % (i, ab[i].tobytes().hex(), bb_[i].tobytes().hex()))
+            # all matrices in one call (each its own imatrix row)
+            xb = np.ascontiguousarray(np.stack(xs[:n_exp]))
+            ib = np.ascontiguousarray(np.stack(imv[:n_exp]).astype(np.float32))
+            ob = np.empty(n_exp * len(cpu_all[0]), dtype=np.uint8)
+            t3 = time.time()
+            got3 = gq.gpuq_quantize_batch(int(typ), xb.ctypes.data, ob.ctypes.data, n_exp, ne1, ne0,
+                                          ib.ctypes.data if with_im else None)
+            t4 = time.time()
+            bdiff = len(ob) // bb if got3 != len(ob) else int(
+                (ob.reshape(-1, bb) != np.concatenate(cpu_all).reshape(-1, bb)).any(axis=1).sum())
+            label = name + ("" if not kq else " +im" if with_im else " noim")
+            print("%-12s identical blocks %d / %d (%.4f%%), batch of %d: %s   cpu 1 thread %.3f s/matrix, gpu %.4f s/matrix"
+                  " (x%.0f), batch %.4f s/matrix" %
+                  (label, same, blocks, 100.0 * same / blocks, n_exp, "identical" if bdiff == 0 else "%d differ" % bdiff,
+                   tc / n_exp, tg / n_exp, tc / max(tg, 1e-9), (t4 - t3) / n_exp), flush=True)
+            bad += blocks - same + bdiff
     # reading the source on the GPU (gpuq_requantize): the source bytes -> GPU floats -> IQ2_XXS, against ggml's
     # to_float -> ggml_quantize_chunk. Self-test: the first matrix stored as each source type; a model: its own tensor.
     if selftest:

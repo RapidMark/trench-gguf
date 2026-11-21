@@ -3,7 +3,7 @@ for byte. Rules may name 2-D tensors too (attention, shared experts, embeddings:
 the same way as one expert.
 
 usage: requant_experts.py <in shard 1> <out dir> <rules file> --imatrix=<imatrix.gguf> [--check] [--threads=N]
-                         [--gpu[=<device>]] [--hessian=<dir> [--damp=0.01] [--damp-iq1=D] [--order=seq|act] [--weights=imatrix|diag|schur]
+                         [--gpu=<device>] [--cpu] [--hessian=<dir> [--damp=0.01] [--damp-iq1=D] [--order=seq|act] [--weights=imatrix|diag|schur]
                          [--gated] [--no-feedback] [--sub=32|8 [--scale-search=K]]]
                          [--dump=<hessian_dump dir> [--dump-device=cpu|cuda|numpy]] [--ldlq-cpu] [--ldlq-f32] [--gpu-threads=N]
                          [--dense-dump=<hessian_dump --dense dir> [--dense-max-rows=N]] [--only-matched]
@@ -22,11 +22,14 @@ Q6_K -> Q8_0, F16 when even that does not fit).  A tensor the imatrix has no dat
 quantized without one when the type allows it; the very low-bit types (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S) need it,
 as in llama-quantize, so such a tensor is left as is - give it a rule of its own with another type (iq4_xs, q4_k ...).
 
---gpu quantizes IQ1_S / IQ1_M / IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / IQ4_NL on the GPU with
-gpuq/libgpuq.so (ggml's quantizers line for line: byte-identical output, checked by gpuq/test_gpuq.py); sources in
-F32 / F16 / BF16 / Q8_0 / MXFP4 are dequantized on the GPU as well (others on the CPU threads); other target types, and
-tensors without imatrix data, stay on the CPU.  GPUQ_LIB picks the library (libgpuq_cuda.so for CUDA), GPUQ_DIR its
-folder.
+The GPU quantizes by default (gpuq: byte-identical to ggml_quantize_chunk, checked by gpuq/test_gpuq.py): IQ1_S /
+IQ1_M / IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / IQ4_NL, the k-quants Q2_K / Q3_K / Q4_K / Q5_K / Q6_K
+and Q8_0, the 2-D tensors the rules name included (a big one in row batches). Without imatrix data the k-quants, Q8_0,
+IQ4_NL and IQ4_XS take ggml's no-imatrix path on the GPU as well; IQ3_XXS / IQ3_S without one stay on the CPU.
+Sources in F32 / F16 / BF16 / Q8_0 / MXFP4 are dequantized on the GPU too (others on the CPU threads). --gpu=N picks
+the device, --cpu forces the CPU threads; with no built library (./build.sh / ./setup.sh) or no GPU it says so and uses
+the CPU. GPUQ_LIB picks the library (default: libgpuq_cuda.so, then libgpuq.so), GPUQ_DIR its folder, GPUQ_BATCH_MB
+the floats on the GPU a call (default 2048).
 
 --hessian=<dir> turns on error-feedback rounding (tools/ldlq.py: GPTQ / block-LDLQ around ggml's own quantizer, the
 output stays the plain GGUF format) for the expert tensors the folder has a Hessian for: blk.L.in.npy [n_expert, ne0,
@@ -53,7 +56,7 @@ grouped attn_output_a) takes diag(H)/n as the importance. --dense-max-rows caps 
 The down input recompute (--dump) applies the model's SwiGLU clamp (<arch>.swiglu_clamp_exp, DeepSeek V4 / V4.1) as
 llama.cpp's ggml_swiglu_clamp does.
 
-With --gpu and --dump-device=cuda the whole error-feedback loop runs on the GPU (tools/ldlq.py quantize_matrix_torch:
+With the GPU (the default) and --dump-device=cuda the whole error-feedback loop runs on the GPU (tools/ldlq.py quantize_matrix_torch:
 the weights stay on the device, gpuq's device kernels quantize and dequantize each super-block column, the error update
 is a GPU GEMM in float64 as on the CPU; gate and up of an expert go through as one batch). The bytes are not bit for bit
 the CPU loop's (another GEMM summation order), the quality is the same within run noise. --ldlq-cpu keeps the CPU loop
@@ -108,6 +111,61 @@ class TypeTraits(ctypes.Structure):
 
 
 TO_FLOAT = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64)
+
+
+def load_gpuq(device=0, quiet=False):
+    """gpuq (the GPU quantizer) on device, or None with a one-line reason (no library built, no GPU, an old library):
+    the caller then quantizes on the CPU. GPUQ_LIB / trench.env pick the library; else libgpuq_cuda.so, then
+    libgpuq.so (ROCm) in GPUQ_DIR (default gpuq/ next to tools/)."""
+    here = os.environ.get("GPUQ_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "gpuq"))
+    names = [_env("GPUQ_LIB")] if _env("GPUQ_LIB") else ["libgpuq_cuda.so", "libgpuq.so"]
+    why = []
+    for nm in names:
+        path = os.path.join(here, nm)
+        if not os.path.exists(path):
+            why.append("%s not built" % nm)
+            continue
+        try:
+            gq = ctypes.CDLL(path)
+        except OSError as e:   # (e.g. the CUDA library on a box without the CUDA runtime)
+            why.append("%s: %s" % (nm, str(e).splitlines()[0][:120]))
+            continue
+        gq.gpuq_init.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        gq.gpuq_quantize.restype = ctypes.c_size_t
+        gq.gpuq_quantize.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64,
+                                     ctypes.c_void_p]
+        gq.gpuq_block_bytes.restype = ctypes.c_size_t
+        gq.gpuq_requantize.restype = ctypes.c_size_t
+        gq.gpuq_requantize.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int64,
+                                       ctypes.c_int64, ctypes.c_void_p]
+        gq.batch = hasattr(gq, "gpuq_quantize_batch")   # (a library from before v0.4.1: no k-quants, no batches)
+        if gq.batch:
+            gq.gpuq_quantize_batch.restype = ctypes.c_size_t
+            gq.gpuq_quantize_batch.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64,
+                                               ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p]
+            gq.gpuq_requantize_batch.restype = ctypes.c_size_t
+            gq.gpuq_requantize_batch.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+                                                 ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p]
+            gq.gpuq_can_quantize.argtypes = [ctypes.c_int, ctypes.c_int]
+        rc = gq.gpuq_init(os.path.join(here, "gpuq_tables.bin").encode(), int(device))
+        if rc != 0:
+            why.append("%s: gpuq_init %d (no GPU %d, or gpuq_tables.bin missing)" % (nm, rc, int(device)))
+            continue
+        gq.name = nm
+        return gq
+    if not quiet:
+        print("GPU quantizer not available (%s): quantizing on the CPU. Build it with ./build.sh (or ./setup.sh); "
+              "--cpu silences this." % "; ".join(why), flush=True)
+    return None
+
+
+def gpuq_takes(gq, typ, with_imatrix):
+    """whether gpuq quantizes typ (with or without an imatrix) byte-identically to ggml"""
+    if gq is None:
+        return False
+    if gq.batch:
+        return gq.gpuq_can_quantize(int(typ), 1 if with_imatrix else 0) == 1
+    return with_imatrix and gq.gpuq_block_bytes(int(typ)) > 0   # (an old library: the imatrix i-quants only)
 
 
 def read_rules(path):
@@ -242,6 +300,8 @@ def main() -> int:
     imat_path = next((a.split("=", 1)[1] for a in flags if a.startswith("--imatrix=")), None)
     threads = int(next((a.split("=", 1)[1] for a in flags if a.startswith("--threads=")), os.cpu_count() or 8))
     gpu = next((a for a in flags if a == "--gpu" or a.startswith("--gpu=")), None)
+    force_cpu = "--cpu" in flags
+    gpu_batch_mb = int(os.environ.get("GPUQ_BATCH_MB", "2048"))
     hess_dir = next((a.split("=", 1)[1] for a in flags if a.startswith("--hessian=")), None)
     hess_opt = {"damp": float(next((a.split("=", 1)[1] for a in flags if a.startswith("--damp=")), 0.01)),
                 "damp_iq1": next((float(a.split("=", 1)[1]) for a in flags if a.startswith("--damp-iq1=")), None),
@@ -299,21 +359,10 @@ def main() -> int:
     to_float = {}
     gq = None
     gq_lock = threading.Lock()
-    if gpu is not None:
-        here = os.environ.get("GPUQ_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "gpuq"))
-        gq = ctypes.CDLL(os.path.join(here, _env("GPUQ_LIB") or "libgpuq.so"))   # (CUDA: libgpuq_cuda.so)
-        gq.gpuq_init.argtypes = [ctypes.c_char_p, ctypes.c_int]
-        gq.gpuq_quantize.restype = ctypes.c_size_t
-        gq.gpuq_quantize.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64,
-                                     ctypes.c_void_p]
-        gq.gpuq_block_bytes.restype = ctypes.c_size_t
-        gq.gpuq_requantize.restype = ctypes.c_size_t
-        gq.gpuq_requantize.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int64,
-                                       ctypes.c_int64, ctypes.c_void_p]
-        rc = gq.gpuq_init(os.path.join(here, "gpuq_tables.bin").encode(), int(gpu.split("=", 1)[1]) if "=" in gpu else 0)
-        if rc != 0:
-            print("gpuq_init failed (%d)" % rc)
-            return 1
+    if not force_cpu and not check:
+        gq = load_gpuq(int(gpu.split("=", 1)[1]) if gpu and "=" in gpu else 0)
+        if gq is not None:
+            print("quantizing on the GPU (gpuq/%s; --cpu for the CPU threads)" % gq.name, flush=True)
     # the error-feedback loop on the GPU: gpuq's device kernels + torch on the same device
     gpu_ldlq = gq is not None and dump_device == "cuda" and not ldlq_cpu and (hess_dir or dump_dir or dense_dir)
     torch = None
@@ -465,7 +514,7 @@ def main() -> int:
             dst = np.empty((ne2, per), dtype=np.uint8)
             im = None if t.name in no_im else imat.get(t.name)   # (None: quantized without one, as llama-quantize does)
 
-            on_gpu = gq is not None and im is not None and gq.gpuq_block_bytes(int(new_type)) > 0
+            on_gpu = gpuq_takes(gq, new_type, im is not None)
             esc = escale.get(t.name)   # (NVFP4: expert e's weights x esc[e])
             gpu_dq = on_gpu and esc is None and gq.gpuq_can_dequantize(int(src)) == 1   # (read the source bytes on the GPU too)
 
@@ -684,7 +733,7 @@ def main() -> int:
                 if gpu_dq:
                     with gq_lock:
                         return gq.gpuq_requantize(int(src), raw[e].ctypes.data, int(new_type), dst[e].ctypes.data, ne1,
-                                                  ne0, im[e].ctypes.data)
+                                                  ne0, None if im is None else im[e].ctypes.data)
                 f32 = np.empty(ne1 * ne0, dtype=np.float32)
                 to_float[src](raw[e].ctypes.data, f32.ctypes.data, ne1 * ne0)
                 if esc is not None:
@@ -692,7 +741,7 @@ def main() -> int:
                 if on_gpu:
                     with gq_lock:
                         return gq.gpuq_quantize(int(new_type), f32.ctypes.data, dst[e].ctypes.data, ne1, ne0,
-                                                im[e].ctypes.data)
+                                                None if im is None else im[e].ctypes.data)
                 got = lib.ggml_quantize_chunk(int(new_type), f32.ctypes.data, dst[e].ctypes.data, 0, ne1, ne0,
                                               None if im is None else im[e].ctypes.data)
                 return got
@@ -711,6 +760,59 @@ def main() -> int:
                             print("quantizer wrote %d bytes, expected %d for %s expert %d" % (got, per, t.name, e))
                             return 1
                         dst[e] = np.frombuffer(b, dtype=np.uint8)
+                ex_map = []
+            elif on_gpu and gq.batch and hess is None:
+                # the plain path on the GPU, GPUQ_BATCH_MB of floats a call: k experts of a 3-D tensor (each its own
+                # imatrix row), or k rows of a 2-D one (a 118 GiB per-layer embedding fits no GPU, nor RAM as floats);
+                # the next batch's source bytes are read from disk (or decoded on the CPU) while the GPU works
+                rows2d = ne2 == 1
+                unit_f = ne0 if rows2d else ne1 * ne0          # floats a unit (a row / an expert)
+                nunit = ne1 if rows2d else ne2
+                k = max(1, min(nunit, (gpu_batch_mb << 20) // max(1, unit_f * 4)))
+                imb = None if im is None else np.ascontiguousarray(im, dtype=np.float32)
+                if imb is not None and imb.shape[0] != ne2:
+                    imb = np.ascontiguousarray(np.broadcast_to(imb[:1], (ne2, ne0)))
+                src_u = raw.reshape(nunit, -1)                  # (source bytes a unit)
+                dst_u = dst.reshape(nunit, -1)
+                per_u = dst_u.shape[1]
+
+                def load(u0):
+                    u1 = min(nunit, u0 + k)
+                    if gpu_dq:
+                        return np.ascontiguousarray(src_u[u0:u1])   # (the copy pages the source in)
+                    f32 = np.empty((u1 - u0, unit_f), dtype=np.float32)
+                    step = max(1, (u1 - u0) // threads) if rows2d else 1
+
+                    def dq(i):
+                        j = min(u1 - u0, i + step)
+                        to_float[src](src_u[u0 + i:u0 + j].ctypes.data if rows2d else src_u[u0 + i].ctypes.data,
+                                      f32[i].ctypes.data, (j - i) * unit_f)
+                        if esc is not None:
+                            f32[i] *= esc[u0 + i]
+                    with concurrent.futures.ThreadPoolExecutor(threads) as dex:
+                        list(dex.map(dq, range(0, u1 - u0, step)))
+                    return f32
+
+                with concurrent.futures.ThreadPoolExecutor(1) as pre:
+                    nxt = pre.submit(load, 0)
+                    for u0 in range(0, nunit, k):
+                        u1 = min(nunit, u0 + k)
+                        buf = nxt.result()
+                        if u1 < nunit:
+                            nxt = pre.submit(load, u1)
+                        nm, nr = (1, u1 - u0) if rows2d else (u1 - u0, ne1)
+                        w_ = None if imb is None else imb[0 if rows2d else u0].ctypes.data
+                        with gq_lock:
+                            if gpu_dq:
+                                got = gq.gpuq_requantize_batch(int(src), buf.ctypes.data, int(new_type),
+                                                               dst_u[u0].ctypes.data, nm, nr, ne0, w_)
+                            else:
+                                got = gq.gpuq_quantize_batch(int(new_type), buf.ctypes.data, dst_u[u0].ctypes.data, nm,
+                                                             nr, ne0, w_)
+                        if got != per_u * (u1 - u0):
+                            print("gpuq wrote %d bytes, expected %d for %s, %s %d-%d" % (
+                                got, per_u * (u1 - u0), t.name, "rows" if rows2d else "experts", u0, u1 - 1))
+                            return 1
                 ex_map = []
             else:
                 ex_map = None

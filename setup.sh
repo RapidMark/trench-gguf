@@ -180,7 +180,7 @@ step 7/8 "self-test (byte-identical to ggml)"
 if [ $TEST = 1 ]; then
   LIBGGML=$LIBGGML GPUQ_LIB=$LIB .venv/bin/python gpuq/test_gpuq.py --selftest | tee "$ROOT/setup-test.log" | sed 's/^/  /'
   grep -q "^OK" "$ROOT/setup-test.log" || fail "the GPU output differs from ggml" \
-    "do not use --gpu with this build; report setup-test.log at https://github.com/zephel01/trench-gguf/issues"
+    "pass --cpu to the tools with this build; report setup-test.log at https://github.com/zephel01/trench-gguf/issues"
 else
   echo "  skipped (--no-test)"
 fi
@@ -195,4 +195,4 @@ export LLAMA_BIN=$GBUILD/bin
 export TEACHER=$ROOT/tools/teacher
 export PATH=$ROOT/.venv/bin:\$PATH
 EOF
-ok "source trench.env, then: python tools/requant_experts.py ... --gpu"
+ok "source trench.env, then: python tools/requant_experts.py ... (the GPU by default)"
