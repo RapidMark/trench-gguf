@@ -21,8 +21,8 @@ changed).
   tiny blocks) and on Hy4-flash BF16 experts; Hy4-flash re-made from its BF16 GGUF in A's layout (IQ2_XXS / IQ3_XXS
   experts, Q8_0 elsewhere, IQ4_NL embedding table) in 5 min 22 s against 51 min 33 s for llama-quantize on 32
   threads, every one of the 1,380 tensors identical to llama-quantize's file.
-- Not checked yet: the k-quants and Q8_0 on ROCm (the self-test of `./setup.sh` tells); `convert_hf.py` end to end
-  with the new defaults.
+- ROCm: the self-test (random weights, all 15 types, both imatrix paths) passes on a Radeon 8060S iGPU (gfx1151);
+  real weights and the R9700 not run yet. Not run yet either: `convert_hf.py` end to end with the new defaults.
 
 ## v0.4.0 - 2026-11-20
 

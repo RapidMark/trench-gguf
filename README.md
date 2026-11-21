@@ -530,7 +530,7 @@ The start-up is reading the 0.8 GB imatrix and opening the source.
   through ggml. Sources dequantized on the GPU: F32, F16, BF16, Q8_0, MXFP4.
 - **Models**: MoE experts only; see [Supported models](#-supported-models) for rows that fall back and why.
 - **CUDA**: checked on an RTX 5090 (sm_120, CUDA 13): all 15 types and the GPU-read sources byte-identical, the LDLQ
-  loop's test passes. The k-quants and Q8_0 are not checked on ROCm yet (the self-test of `./setup.sh` tells).
+  loop's test passes. On ROCm the k-quants and Q8_0 passed the self-test (random weights) on a Radeon 8060S iGPU (gfx1151).
 - **LDLQ**: the GPU loop needs torch for your GPU (`./setup.sh --torch-gpu`); without it, `--dump-device=cpu` runs
   the same loop on the CPU, much slower. Experts with fewer than 64 calibration rows fall back to plain rounding.
 - **Platforms**: checked on x86-64 Linux only. On ARM, gcc fuses FMA by default, so ggml's own CPU output changes;

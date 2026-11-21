@@ -555,7 +555,7 @@ RTX 5090（OCuLink Gen4 x4）、同じ CPU、Hy4-flash の BF16 GGUF（438 GB、
 
 - **型**：GPU で計算するのは IQ1_S、IQ1_M、IQ2_XXS、IQ2_XS、IQ2_S、IQ3_XXS、IQ3_S、IQ4_XS、IQ4_NL、Q2_K、Q3_K、Q4_K、Q5_K、Q6_K、Q8_0 です。それ以外の型（行の長さが合わないときの代わりの Q4_0、Q5_0、Q5_1 など）は、ggml を通して CPU で計算します。元の重みを GPU で float に戻せるのは、F32、F16、BF16、Q8_0、MXFP4 です。
 - **モデル**：MoE のエキスパートだけが対象です。代わりの型になるテンソルとその理由は、[対応するモデル](#-対応するモデル)を見てください。
-- **CUDA**：RTX 5090（sm_120、CUDA 13）で確かめました。15 の型すべてと、GPU で読む元の型が ggml とバイト単位で一致し、LDLQ のループのテストも通ります。k-quant と Q8_0 は ROCm ではまだ確かめていません（`./setup.sh` の自己テストでわかります）。
+- **CUDA**：RTX 5090（sm_120、CUDA 13）で確かめました。15 の型すべてと、GPU で読む元の型が ggml とバイト単位で一致し、LDLQ のループのテストも通ります。ROCm では、k-quant と Q8_0 も Radeon 8060S の iGPU（gfx1151）で自己テスト（乱数の重み）を通りました。
 - **LDLQ**：GPU で回すには、GPU 版の torch が要ります（`./setup.sh --torch-gpu`）。無い場合は `--dump-device=cpu` で同じ処理を CPU で回せますが、かなり遅くなります。校正データで 64 行に満たないエキスパートは、普通の丸めになります。
 - **環境**：確かめたのは x86-64 の Linux だけです。
   - ARM では gcc がふつうに FMA を使うので、ggml の CPU の出力そのものが変わります。
