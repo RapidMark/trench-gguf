@@ -27,6 +27,8 @@
 #define hipGetLastError cudaGetLastError
 #define hipDeviceSynchronize cudaDeviceSynchronize
 #define hipStream_t cudaStream_t
+#define hipHostMalloc(p, n, f) cudaMallocHost(p, n)
+#define hipHostFree cudaFreeHost
 #else
 #include <hip/hip_runtime.h>
 #endif
@@ -1847,6 +1849,336 @@ __global__ void kq(const float * x, const float * qw, B * y, int64_t nblocks, in
     Q(x + b*BS, qw ? qw + ((b / qw_mat) * qw_mod + (b % qw_mod) / qw_div)*BS : nullptr, y + b, t);
 }
 
+// our build: IQ2_XS with one thread a 16-weight sub-block (16 lanes a super-block) instead of one thread a super-block.
+// The sub-blocks' searches are independent in ggml (only sigma2 and max_scale are shared), so each lane runs the same
+// code in the same order on its own sub-block: byte-identical, with far less per-thread state.
+QD void q_iq2_xs_sub(const float * xbl, const float * qwbl, int ib, float sigma2, Tab t, float * out_scale, uint16_t * q2o) {
+    const uint64_t * kgrid_q2xs = t.grid;
+    const int * kmap_q2xs = t.map;
+    const uint16_t * kneighbors_q2xs = t.neigh;
+    const int kMaxQ = 3;
+    float weight[16];
+    float xval[16];
+    int8_t L[16];
+    int8_t Laux[16];
+    float waux[16];
+    bool is_on_grid[2];
+    bool is_on_grid_aux[2];
+    uint8_t block_signs[2];
+    {
+        const float * xb = xbl + 16*ib;
+        const float * qw = qwbl + 16*ib;
+        for (int i = 0; i < 16; ++i) weight[i] = qw[i] * sqrtf(sigma2 + xb[i]*xb[i]);
+        for (int i = 0; i < 16; ++i) waux[i] = sqrtf(weight[i]);
+        for (int k = 0; k < 2; ++k) {
+            int nflip = 0;
+            uint8_t s = 0;
+            for (int i = 0; i < 8; ++i) {
+                if (xb[8*k + i] >= 0) xval[8*k + i] = xb[8*k + i];
+                else { xval[8*k + i] = -xb[8*k + i]; ++nflip; s |= (1 << i); }
+            }
+            if (nflip%2) {
+                int imin = 0; float min = weight[8*k+imin]*xb[8*k+imin]*xb[8*k+imin];
+                for (int i = 1; i < 8; ++i) {
+                    float ax = weight[8*k+i]*xb[8*k+i]*xb[8*k+i];
+                    if (ax < min) { min = ax; imin = i; }
+                }
+                xval[8*k+imin] = -xval[8*k+imin];
+                s ^= (1 << imin);
+            }
+            block_signs[k] = s & 127;
+        }
+        float max = xval[0];
+        for (int i = 1; i < 16; ++i) max = MAX(max, xval[i]);
+        for (int i = 0; i < 16; ++i) L[i] = 0;
+        if (max < GROUP_MAX_EPS) {
+            *out_scale = 0;
+            return;
+        }
+        float best = 0;
+        float scale = max/(2*kMaxQ-1);
+        is_on_grid[0] = is_on_grid[1] = true;
+        for (int is = -9; is <= 9; ++is) {
+            float id = (2*kMaxQ-1+is*0.1f)/max;
+            float this_scale = 1/id;
+            for (int k = 0; k < 2; ++k) {
+                for (int i = 0; i < 8; ++i) {
+                    int l = nearest_int(0.5f*(id*xval[8*k+i]-1));
+                    Laux[8*k+i] = MAX(0, MIN(kMaxQ-1, l));
+                }
+                uint16_t u = 0;
+                for (int i = 0; i < 8; ++i) u |= (Laux[8*k+i] << 2*i);
+                int grid_index = kmap_q2xs[u];
+                is_on_grid_aux[k] = true;
+                if (grid_index < 0) {
+                    is_on_grid_aux[k] = false;
+                    const uint16_t * neighbours = kneighbors_q2xs - kmap_q2xs[u] - 1;
+                    grid_index = iq2_find_best_neighbour(neighbours, kgrid_q2xs, xval + 8*k, waux + 8*k, this_scale, Laux + 8*k);
+                }
+            }
+            float sumqx = 0, sumq2 = 0;
+            for (int i = 0; i < 16; ++i) {
+                float w = weight[i];
+                float q = 2*Laux[i] + 1;
+                sumqx += w*xval[i]*q;
+                sumq2 += w*q*q;
+            }
+            if (sumq2 > 0 && sumqx*sumqx > best*sumq2) {
+                scale = sumqx/sumq2; best = scale*sumqx;
+                for (int i = 0; i < 16; ++i) L[i] = Laux[i];
+                for (int k = 0; k <  2; ++k) is_on_grid[k] = is_on_grid_aux[k];
+            }
+        }
+        int n_not_ongrid = 0;
+        for (int k = 0; k < 2; ++k) if (!is_on_grid[k]) ++n_not_ongrid;
+        if (n_not_ongrid > 0 && scale > 0) {
+            float id = 1/scale;
+            for (int k = 0; k < 2; ++k) {
+                if (is_on_grid[k]) continue;
+                uint16_t u = 0;
+                for (int i = 0; i < 8; ++i) {
+                    int l = nearest_int(0.5f*(id*xval[8*k+i]-1));
+                    l = MAX(0, MIN(kMaxQ-1, l));
+                    u |= (l << 2*i);
+                    L[8*k + i] = l;
+                }
+                int grid_index = kmap_q2xs[u];
+                if (grid_index < 0) {
+                    const uint16_t * neighbours = kneighbors_q2xs - kmap_q2xs[u] - 1;
+                    grid_index = iq2_find_best_neighbour(neighbours, kgrid_q2xs, xval + 8*k, waux + 8*k, scale, L + 8*k);
+                }
+            }
+            float sumqx = 0, sumq2 = 0;
+            for (int i = 0; i < 16; ++i) {
+                float w = weight[i];
+                float q = 2*L[i] + 1;
+                sumqx += w*xval[i]*q;
+                sumq2 += w*q*q;
+            }
+            if (sumq2 > 0) scale = sumqx/sumq2;
+        }
+        if (scale < 0) {
+            scale = -scale;
+            for (int k = 0; k < 2; ++k) block_signs[k] = (~block_signs[k]) & 127;
+        }
+        for (int k = 0; k < 2; ++k) {
+            uint16_t u = 0;
+            for (int i = 0; i < 8; ++i) u |= (L[8*k+i] << 2*i);
+            int grid_index = kmap_q2xs[u];
+            if (grid_index < 0) GPUQ_TRAP();
+            q2o[k] = grid_index | (block_signs[k] << 9);
+        }
+        *out_scale = scale;
+    }
+}
+
+__global__ void kq_iq2_xs_par(const float * x, const float * qw, block_iq2_xs * y, int64_t nblocks, int64_t qw_mod,
+                              int64_t qw_div, Tab t, int64_t qw_mat = INT64_MAX) {
+    __shared__ float s_scale[16][16];
+    __shared__ uint16_t s_q2[16][32];
+    const int sbl = threadIdx.x / 16, ib = threadIdx.x % 16;
+    const int64_t b = (int64_t) blockIdx.x * 16 + sbl;
+    const bool ok = b < nblocks;
+    if (ok) {
+        const float * xbl = x + b*QK_K;
+        const float * qwbl = qw + ((b / qw_mat) * qw_mod + (b % qw_mod) / qw_div)*QK_K;
+        float sumx2 = 0;
+        for (int i = 0; i < QK_K; ++i) sumx2 += xbl[i]*xbl[i];
+        const float sigma2 = sumx2/QK_K;
+        uint16_t q2o[2] = {0, 0};
+        float sc = 0;
+        q_iq2_xs_sub(xbl, qwbl, ib, sigma2, t, &sc, q2o);
+        s_scale[sbl][ib] = sc;
+        s_q2[sbl][2*ib] = q2o[0]; s_q2[sbl][2*ib+1] = q2o[1];
+    }
+    __syncthreads();
+    if (!ok || ib != 0) return;
+    block_iq2_xs * yb = y + b;
+    yb->d = fp32_to_fp16(0.f);
+    for (int i = 0; i < QK_K/32; ++i) yb->scales[i] = 0;
+    float max_scale = 0;
+    for (int k = 0; k < QK_K/16; ++k) max_scale = MAX(max_scale, s_scale[sbl][k]);
+    if (!max_scale) {
+        for (int i = 0; i < QK_K/8; ++i) yb->qs[i] = 0;
+        return;
+    }
+    float d = max_scale/31;
+    yb->d = fp32_to_fp16(d);
+    float id = 1/d;
+    for (int k = 0; k < QK_K/16; ++k) {
+        int l = nearest_int(0.5f*(id*s_scale[sbl][k]-1));
+        l = MAX(0, MIN(15, l));
+        if (k%2 == 0) yb->scales[k/2] = l;
+        else yb->scales[k/2] |= (l << 4);
+    }
+    for (int i = 0; i < QK_K/8; ++i) yb->qs[i] = s_q2[sbl][i];
+}
+
+// our build: IQ2_S with one thread a 16-weight sub-block (as kq_iq2_xs_par); the lane-0 thread packs the bits
+QD void q_iq2_s_sub(const float * xbl, const float * qwbl, int ib, float sigma2, Tab t, float * out_scale,
+                    int * gio, uint8_t * sgo, int * wrote) {
+    const uint64_t * kgrid_q2xs = t.grid;
+    const int * kmap_q2xs = t.map;
+    const uint16_t * kneighbors_q2xs = t.neigh;
+    const int kMaxQ = 3;
+    float weight[16];
+    float xval[16];
+    int8_t L[16];
+    int8_t Laux[16];
+    float waux[16];
+    bool is_on_grid[2];
+    bool is_on_grid_aux[2];
+    uint8_t block_signs[2];
+    {
+        const float * xb = xbl + 16*ib;
+        const float * qw = qwbl + 16*ib;
+        for (int i = 0; i < 16; ++i) weight[i] = qw[i] * sqrtf(sigma2 + xb[i]*xb[i]);
+        for (int i = 0; i < 16; ++i) waux[i] = sqrtf(weight[i]);
+        for (int k = 0; k < 2; ++k) {
+            uint8_t s = 0;
+            for (int i = 0; i < 8; ++i) {
+                if (xb[8*k + i] >= 0) xval[8*k + i] = xb[8*k + i];
+                else { xval[8*k + i] = -xb[8*k + i]; s |= (1 << i); }
+            }
+            block_signs[k] = s;
+        }
+        float max = xval[0];
+        for (int i = 1; i < 16; ++i) max = MAX(max, xval[i]);
+        for (int i = 0; i < 16; ++i) L[i] = 0;
+        if (max < GROUP_MAX_EPS_IQ2_S) {
+            *out_scale = 0;
+            return;
+        }
+        float best = 0;
+        float scale = max/(2*kMaxQ-1);
+        is_on_grid[0] = is_on_grid[1] = true;
+        for (int is = -9; is <= 9; ++is) {
+            float id = (2*kMaxQ-1+is*0.1f)/max;
+            float this_scale = 1/id;
+            for (int k = 0; k < 2; ++k) {
+                for (int i = 0; i < 8; ++i) {
+                    int l = nearest_int(0.5f*(id*xval[8*k+i]-1));
+                    Laux[8*k+i] = MAX(0, MIN(kMaxQ-1, l));
+                }
+                uint16_t u = 0;
+                for (int i = 0; i < 8; ++i) u |= (Laux[8*k+i] << 2*i);
+                int grid_index = kmap_q2xs[u];
+                is_on_grid_aux[k] = true;
+                if (grid_index < 0) {
+                    is_on_grid_aux[k] = false;
+                    const uint16_t * neighbours = kneighbors_q2xs - kmap_q2xs[u] - 1;
+                    grid_index = iq2_find_best_neighbour(neighbours, kgrid_q2xs, xval + 8*k, waux + 8*k, this_scale, Laux + 8*k);
+                }
+            }
+            float sumqx = 0, sumq2 = 0;
+            for (int i = 0; i < 16; ++i) {
+                float w = weight[i];
+                float q = 2*Laux[i] + 1;
+                sumqx += w*xval[i]*q;
+                sumq2 += w*q*q;
+            }
+            if (sumq2 > 0 && sumqx*sumqx > best*sumq2) {
+                scale = sumqx/sumq2; best = scale*sumqx;
+                for (int i = 0; i < 16; ++i) L[i] = Laux[i];
+                for (int k = 0; k <  2; ++k) is_on_grid[k] = is_on_grid_aux[k];
+            }
+        }
+        int n_not_ongrid = 0;
+        for (int k = 0; k < 2; ++k) if (!is_on_grid[k]) ++n_not_ongrid;
+        if (n_not_ongrid > 0 && scale > 0) {
+            float id = 1/scale;
+            for (int k = 0; k < 2; ++k) {
+                if (is_on_grid[k]) continue;
+                uint16_t u = 0;
+                for (int i = 0; i < 8; ++i) {
+                    int l = nearest_int(0.5f*(id*xval[8*k+i]-1));
+                    l = MAX(0, MIN(kMaxQ-1, l));
+                    u |= (l << 2*i);
+                    L[8*k + i] = l;
+                }
+                int grid_index = kmap_q2xs[u];
+                if (grid_index < 0) {
+                    const uint16_t * neighbours = kneighbors_q2xs - kmap_q2xs[u] - 1;
+                    grid_index = iq2_find_best_neighbour(neighbours, kgrid_q2xs, xval + 8*k, waux + 8*k, scale, L + 8*k);
+                }
+            }
+            float sumqx = 0, sumq2 = 0;
+            for (int i = 0; i < 16; ++i) {
+                float w = weight[i];
+                float q = 2*L[i] + 1;
+                sumqx += w*xval[i]*q;
+                sumq2 += w*q*q;
+            }
+            if (sumq2 > 0) scale = sumqx/sumq2;
+        }
+        if (scale < 0) {
+            scale = -scale;
+            for (int k = 0; k < 2; ++k) block_signs[k] = ~block_signs[k];
+        }
+        for (int k = 0; k < 2; ++k) {
+            uint16_t u = 0;
+            for (int i = 0; i < 8; ++i) u |= (L[8*k+i] << 2*i);
+            int grid_index = kmap_q2xs[u];
+            if (grid_index < 0) GPUQ_TRAP();
+            gio[k] = grid_index; sgo[k] = block_signs[k]; *wrote = 1;
+        }
+        *out_scale = scale;
+    }
+}
+
+__global__ void kq_iq2_s_par(const float * x, const float * qw, block_iq2_s * y, int64_t nblocks, int64_t qw_mod,
+                             int64_t qw_div, Tab t, int64_t qw_mat = INT64_MAX) {
+    __shared__ float s_scale[16][16];
+    __shared__ int s_gi[16][32];
+    __shared__ uint8_t s_sg[16][32];
+    __shared__ uint8_t s_wr[16][16];
+    const int sbl = threadIdx.x / 16, ib = threadIdx.x % 16;
+    const int64_t b = (int64_t) blockIdx.x * 16 + sbl;
+    const bool ok = b < nblocks;
+    if (ok) {
+        const float * xbl = x + b*QK_K;
+        const float * qwbl = qw + ((b / qw_mat) * qw_mod + (b % qw_mod) / qw_div)*QK_K;
+        float sumx2 = 0;
+        for (int i = 0; i < QK_K; ++i) sumx2 += xbl[i]*xbl[i];
+        const float sigma2 = 2*sumx2/QK_K;
+        int gio[2] = {0, 0}; uint8_t sgo[2] = {0, 0}; int wrote = 0;
+        float sc = 0;
+        q_iq2_s_sub(xbl, qwbl, ib, sigma2, t, &sc, gio, sgo, &wrote);
+        s_scale[sbl][ib] = sc;
+        s_gi[sbl][2*ib] = gio[0]; s_gi[sbl][2*ib+1] = gio[1];
+        s_sg[sbl][2*ib] = sgo[0]; s_sg[sbl][2*ib+1] = sgo[1];
+        s_wr[sbl][ib] = (uint8_t) wrote;
+    }
+    __syncthreads();
+    if (!ok || ib != 0) return;
+    block_iq2_s * yb = y + b;
+    { uint8_t * p = (uint8_t *) yb; for (int i = 0; i < (int) sizeof(block_iq2_s); ++i) p[i] = 0; }
+    yb->d = fp32_to_fp16(0.f);
+    float max_scale = 0;
+    for (int k = 0; k < QK_K/16; ++k) {
+        if (s_wr[sbl][k]) {
+            for (int kk = 0; kk < 2; ++kk) {
+                const int i8 = 2*k + kk;
+                const int grid_index = s_gi[sbl][i8];
+                yb->qs[i8] = grid_index & 255;
+                yb->qh[i8/4] |= ((grid_index >> 8) << 2*(i8%4));
+                yb->qs[QK_K/8 + i8] = s_sg[sbl][i8];
+            }
+        }
+        max_scale = MAX(max_scale, s_scale[sbl][k]);
+    }
+    if (!max_scale) return;
+    float d = max_scale/31;
+    yb->d = fp32_to_fp16(d * 0.9875f);
+    float id = 1/d;
+    for (int k = 0; k < QK_K/16; ++k) {
+        int l = nearest_int(0.5f*(id*s_scale[sbl][k]-1));
+        l = MAX(0, MIN(15, l));
+        if (k%2 == 0) yb->scales[k/2] = l;
+        else yb->scales[k/2] |= (l << 4);
+    }
+}
+
 // ---------------------------------------------------------------- ggml's dequantizers (dequantize_row_iq*: ggml-quants.c)
 // one thread a super-block; the grids are ggml-common.h's (gpuq_tables.bin, type 1000 + ggml type); ksigns_iq2xs[k] =
 // k with its parity in bit 7, kmask_iq2xs[j] = 1 << j. Only multiplies and adds in ggml's order: bit-identical in fp32.
@@ -2142,6 +2474,16 @@ __global__ void kdq(int src, const uint8_t * in, float * out, int64_t n) {   // 
 
 namespace {
 uint8_t * g_raw = nullptr; size_t g_raw_cap = 0;
+uint8_t * g_hy = nullptr; size_t g_hy_cap = 0;   // pinned host staging for the results (no pageable D2H copies)
+
+bool grow_pinned(uint8_t ** p, size_t * cap, size_t need) {
+    if (need <= *cap) return true;
+    if (*p) (void) hipHostFree(*p);
+    *p = nullptr; *cap = 0;
+    if (hipHostMalloc((void **) p, need, 0) != hipSuccess) { *p = nullptr; return false; }
+    *cap = need;
+    return true;
+}
 
 size_t raw_bytes(int src, int64_t n) {
     switch (src) {
@@ -2180,10 +2522,10 @@ size_t quantize_gx(int type, void * dst, int64_t nmat, int64_t nrow, int64_t n_p
 #define KQ(B, F, ...) kq<B, F, ##__VA_ARGS__><<<grid, th>>>(g_x, qw, (B *) g_y, nblocks, nb_row, 1, t, nb_mat)
     switch (type) {
         case T_IQ2_XXS: KQ(block_iq2_xxs, q_iq2_xxs); break;
-        case T_IQ2_S:   KQ(block_iq2_s,   q_iq2_s  ); break;
+        case T_IQ2_S:   if (qw) kq_iq2_s_par<<<(unsigned) ((nblocks + 15) / 16), 256>>>(g_x, qw, (block_iq2_s *) g_y, nblocks, nb_row, 1, t, nb_mat); else KQ(block_iq2_s,   q_iq2_s  ); break;
         case T_IQ1_S:   KQ(block_iq1_s,   q_iq1_s  ); break;
         case T_IQ1_M:   KQ(block_iq1_m,   q_iq1_m  ); break;
-        case T_IQ2_XS:  KQ(block_iq2_xs,  q_iq2_xs ); break;
+        case T_IQ2_XS:  if (qw) kq_iq2_xs_par<<<(unsigned) ((nblocks + 15) / 16), 256>>>(g_x, qw, (block_iq2_xs *) g_y, nblocks, nb_row, 1, t, nb_mat); else KQ(block_iq2_xs,  q_iq2_xs ); break;
         case T_IQ3_XXS: KQ(block_iq3_xxs, q_iq3_xxs); break;
         case T_IQ3_S:   KQ(block_iq3_s,   q_iq3_s  ); break;
         case T_IQ4_XS:  KQ(block_iq4_xs,  q_iq4_xs ); break;
@@ -2198,7 +2540,9 @@ size_t quantize_gx(int type, void * dst, int64_t nmat, int64_t nrow, int64_t n_p
     }
 #undef KQ
     if (hipGetLastError() != hipSuccess || hipDeviceSynchronize() != hipSuccess) return 0;
-    if (hipMemcpy(dst, g_y, nblocks * bb, hipMemcpyDeviceToHost) != hipSuccess) return 0;
+    if (!grow_pinned(&g_hy, &g_hy_cap, nblocks * bb)) return 0;
+    if (hipMemcpy(g_hy, g_y, nblocks * bb, hipMemcpyDeviceToHost) != hipSuccess) return 0;
+    memcpy(dst, g_hy, nblocks * bb);
     return nblocks * bb;
 }
 
@@ -2326,3 +2670,10 @@ extern "C" size_t gpuq_dequantize_src_dev(int src, const void * d_raw, float * d
     kdq<<<(unsigned) ((n/32 + th - 1) / th), th, 0, (hipStream_t) stream>>>(src, (const uint8_t *) d_raw, d_out, n);
     return hipGetLastError() == hipSuccess ? (size_t) n * 4 : 0;
 }
+
+// pinned host memory for the caller's source batches (DMA straight from it; never the file's own mapped pages)
+extern "C" void * gpuq_host_alloc(size_t n) {
+    void * p = nullptr;
+    return hipHostMalloc(&p, n, 0) == hipSuccess ? p : nullptr;
+}
+extern "C" void gpuq_host_free(void * p) { if (p) (void) hipHostFree(p); }
